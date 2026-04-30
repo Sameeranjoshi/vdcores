@@ -2,14 +2,20 @@
 #pragma once
 
 #include <cmath>
+
+#ifdef __HIP_PLATFORM_AMD__
+// AMD STUB: rope uses CuTe layouts. Variadic stub keeps dispatch compiling.
+template <int N, typename... Args>
+__device__ __forceinline__ void task_rope_interleaved(Args&&...) { __builtin_trap(); }
+#else
 #include <cute/tensor.hpp>
-#include <cute/arch/mma_sm90.hpp>      // SM80_16x8x16_F16F16F16F16_TN
-#include <cute/atom/mma_atom.hpp>      // MMA_Atom / make_tiled_mma
-#include <cute/algorithm/gemm.hpp>     // cute::gemm
-#include <cute/algorithm/tensor_reduce.hpp>     // cute::reduce
-#include <cute/algorithm/tensor_algorithms.hpp>     // cute::reduce
+#include <cute/arch/mma_sm90.hpp>
+#include <cute/atom/mma_atom.hpp>
+#include <cute/algorithm/gemm.hpp>
+#include <cute/algorithm/tensor_reduce.hpp>
+#include <cute/algorithm/tensor_algorithms.hpp>
 #include <cute/algorithm/functional.hpp>
-#include <cute/algorithm/axpby.hpp> // cute::axpby
+#include <cute/algorithm/axpby.hpp>
 #include <cute/layout.hpp>
 #include <cutlass/array.h>
 #include <cutlass/cutlass.h>
@@ -169,3 +175,5 @@ void task_rope_interleaved(
     // they cannot be merged, when one of them could be local
     c2m.push(thread_id, in_slot | table_slot);
 }
+
+#endif  // __HIP_PLATFORM_AMD__

@@ -1,6 +1,7 @@
 #include "hip/hip_runtime.h"
 #pragma once
 
+#include <cfloat>
 #include "virtualcore.cuh"
 #include "type.cuh"
 

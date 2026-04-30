@@ -2,24 +2,37 @@
 #pragma once
 
 #include <cmath>
+
+#include "context.cuh"
+#include "rms_norm.cuh"
+#include "rope.cuh"
+
+#ifdef __HIP_PLATFORM_AMD__
+// AMD STUB: flash3 attention is built on Hopper WGMMA + CuTe. Replace with
+// MFMA/CK or hipBLAS gemm for AMD CDNA3.
+template <int HeadDim, int BM, int BN, bool A, int B, bool C, bool D,
+          typename KernelQK, typename KernelPV, typename... Args>
+__device__ __forceinline__ void task_attention_fwd_flash3_grouped(Args&&...) { __builtin_trap(); }
+template <int HeadDim, int BM, int BN, bool A, int B, bool C, bool D,
+          typename KernelQK, typename KernelPV, typename... Args>
+__device__ __forceinline__ void task_attention_fwd_flash3_grouped_mma(Args&&...) { __builtin_trap(); }
+template <int A, int B, int C, int D, int E, typename... Args>
+__device__ __forceinline__ void task_split_post_reduce(Args&&...) { __builtin_trap(); }
+#else
 #include <cute/tensor.hpp>
 #include <cute/arch/mma_sm80.hpp>
-#include <cute/arch/mma_sm90.hpp>      // SM80_16x8x16_F16F16F16F16_TN
-#include <cute/atom/mma_atom.hpp>      // MMA_Atom / make_tiled_mma
-#include <cute/algorithm/gemm.hpp>     // cute::gemm
-#include <cute/algorithm/tensor_reduce.hpp>     // cute::reduce
-#include <cute/algorithm/tensor_algorithms.hpp>     // cute::reduce
+#include <cute/arch/mma_sm90.hpp>
+#include <cute/atom/mma_atom.hpp>
+#include <cute/algorithm/gemm.hpp>
+#include <cute/algorithm/tensor_reduce.hpp>
+#include <cute/algorithm/tensor_algorithms.hpp>
 #include <cute/algorithm/functional.hpp>
-#include <cute/algorithm/axpby.hpp> // cute::axpby
+#include <cute/algorithm/axpby.hpp>
 #include <cute/layout.hpp>
 #include <cutlass/array.h>
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
-
-#include "context.cuh"
-#include "rms_norm.cuh"
-#include "rope.cuh"
 
 #define TMP_QK 0
 #define TMP_ROW_MAX 0
@@ -1035,3 +1048,5 @@ __device__ __forceinline__ void task_split_post_reduce(
     __sync_compute_group(128);
     c2m.template push<0, true>(thread_id, slot_final);
 }
+
+#endif  // __HIP_PLATFORM_AMD__

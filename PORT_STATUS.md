@@ -2,44 +2,89 @@
 
 Branch: `hip-port`. Targeting MI300X (gfx942 / CDNA3).
 
-## What's done in this commit
+## Status snapshot
 
-1. **Mechanical hipify pass** — every `.cu` and `.cuh` file under `src/` and `include/` was run through `hipify-perl`. All trivial CUDA runtime APIs are now HIP:
-   - `cudaMalloc/Free/Memcpy*` → `hipMalloc/Free/Memcpy*`
-   - `cudaStream_t / cudaEvent_t` → `hipStream_t / hipEvent_t`
-   - `<cuda_runtime.h>` → `<hip/hip_runtime.h>`
-   - `cudaError_t`, `cudaSuccess`, `cudaGetErrorString`, `cudaFuncSetAttribute`, etc.
-   - Original CUDA files saved at `build/hipify_log/*.prehip` for diff/rollback.
-
-2. **Makefile dual-target** — `make HIP=1 pyext` selects `hipcc --offload-arch=gfx942`; default still uses `nvcc sm_90a`.
-
-3. **Standalone HIP demo** — `app/hip/vdcores_hip_demo.cpp` shows the VDCores pattern (memory-wave + compute-wave + LDS) compiling with pure HIP. Independent of the runtime; verifies the toolchain works on the AMD node.
-
-## What does NOT compile yet on AMD (and why)
-
-The runtime uses Hopper-only features that hipify cannot translate. These will produce build errors on `hipcc` and need real ports:
-
-| Feature | Files | AMD path |
+| Stage | NVIDIA Hopper | AMD MI300X (this branch) |
 |---|---|---|
-| **TMA (`cuTensorMapEncodeTiled`, `cp_async_bulk`)** | `src/runtime.cu`, `src/torch_runtime.cu`, `include/dae/pipeline/stwarp.cuh`, `include/dae/pipeline/ldwarp.cuh` | No equivalent. Replace with `__builtin_amdgcn_global_load_lds` (CDNA3 LDS DMA) or plain wave loads + `__syncthreads()`. |
-| **WGMMA** | `include/task/wgmma.cuh`, `include/task/attention.cuh`, `include/task/gemv.cuh`, `include/dae/compute_dispatch.cuh` | Use **MFMA** intrinsics on CDNA3 (`__builtin_amdgcn_mfma_f32_*`). Different layouts. |
-| **`cuda::barrier`, `cuda::ptx`** (libcu++) | `include/dae/context.cuh`, `include/dae/dae2.cuh`, `include/dae/queue.cuh`, `include/dae/virtualcore.cuh`, `include/dae/type.cuh`, `include/task/rope.cuh`, `include/task/attention.cuh` | No HIP equivalent. Replace with manual `__shared__ atomic_int` barriers and `__builtin_amdgcn_*` intrinsics for laneid/clusterid/globaltimer. |
-| **Inline PTX (`asm volatile(...)`)** | `include/dae/pipeline/ldwarp.cuh` (15), `include/dae/pipeline/stwarp.cuh` (24), `include/dae/queue.cuh` (11), `include/dae/virtualcore.cuh` (11) | Rewrite with `__builtin_amdgcn_*` intrinsics or AMD inline asm (`s_*`, `v_*`, `ds_*`). |
-| **Wavefront size assumption** (32) | scattered, esp. anywhere `blockDim.x` math assumes warp=32 | Adjust block sizes to multiples of 64. |
+| `make pyext` (CUDA) | ✅ Works | n/a |
+| `make HIP=1 runtime.o` | n/a | ✅ **Compiles** (as of commit on this branch) |
+| `make HIP=1 pyext` | n/a | ⚠️  Compiles runtime; PyTorch bindings (`src/torch_runtime.cu`) still need TMA-bytes replacement |
+| Standalone HIP demo (`app/hip/`) | n/a | ✅ Compiles + runs on MI300X |
+| Functional kernels on AMD | ✅ All | ❌ All compute kernels are **stubs that trap** — see below |
 
-## To make `make HIP=1 pyext` actually compile
+## What's actually done
 
-Realistic minimum (per the `vdcores_to_hip.pdf` plan, weeks 3–5):
-1. Replace `cuda::barrier` with HIP-portable `__shared__ uint32_t` + atomic spin barriers.
-2. Replace `cuda::ptx::get_sreg_*` with `__builtin_amdgcn_*` (laneid via `__lane_id()`, blockid via `blockIdx.x`, globaltimer via `__builtin_readcyclecounter()`).
-3. Stub or `#ifdef __HIP_PLATFORM_AMD__` the entire TMA path; teach the launcher to fall back to plain `hipMemcpyAsync`.
-4. Stub WGMMA tasks with a clear "not implemented on HIP" runtime error so unrelated tasks (e.g. RMSNorm, SiLU, Argmax) can still compile and run.
+1. **Mechanical hipify pass** — every `.cu` / `.cuh` under `src/` and `include/` translated:
+   - `cuda*` → `hip*` runtime APIs, `<cuda_runtime.h>` → `<hip/hip_runtime.h>`.
+   - Originals archived at `build/hipify_log/*.prehip`.
 
-## To verify on an AMD node
+2. **Dual-target Makefile** — `make HIP=1 ...` selects `hipcc --offload-arch=gfx942` plus `-D__AMDGCN_WAVEFRONT_SIZE=64 -fPIC`; CUDA path unchanged.
+
+3. **HIP compatibility shim** at `include/dae/hip_compat.cuh`:
+   - `cuda::barrier<thread_scope_block>` — phase-counted block barrier built on a single `unsigned long long` shared atomic. Functional for two-warp queue handoff.
+   - `cuda::ptx::get_sreg_*` — mapped to `__builtin_amdgcn_*` (laneid, clusterid via `blockIdx.x`, globaltimer via `__builtin_readcyclecounter()`).
+   - `cuda::ptx::cp_async_bulk*`, `fence_proxy_async` — TMA paths stubbed (`__builtin_trap`); fence degrades to `__threadfence_block`.
+   - `__shfl_sync` / `__ballot_sync` / `__any_sync` etc. → HIP non-sync forms.
+   - `cuda::aligned_size_t`, `cuda::device::memcpy_async_tx`, `barrier_expect_tx` — TMA helpers stubbed.
+   - `__hip_bfloat16` / `__hip_bfloat162` aliases (CUDA naming → HIP naming).
+   - `cutlass::bfloat16_t`, `cute::SM90_*<...>`, `cute::GMMA::Major`, `Int<>`, `make_shape`, `tile_to_shape` — typedef/struct stubs purely for name lookup so dispatch headers parse.
+   - `__nanosleep` → `__builtin_amdgcn_s_sleep`.
+   - `make_bfloat162`, `__cvta_generic_to_shared` shims.
+
+4. **Standalone HIP demo** — `app/hip/vdcores_hip_demo.cpp` implements the memory-wave + compute-wave + LDS pattern in pure HIP. Compiles + runs.
+
+5. **Stubbed kernels under `__HIP_PLATFORM_AMD__`** — every Hopper-specific kernel now has a variadic-template stub that calls `__builtin_trap()` if exercised. Keeps the runtime infrastructure (scheduler, queues, allocator, dispatch) compiling cleanly while making "silently produces garbage" impossible:
+   - `task_attention_fwd_flash3_grouped(_mma)`, `task_split_post_reduce` (attention.cuh)
+   - `task_gemm` (wgmma.cuh)
+   - `task_gemv`, `task_gemv_mma` (gemv.cuh)
+   - `task_silu_smem`, `task_silu_smem_1D` (silu.cuh)
+   - `task_rope_interleaved` (rope.cuh)
+   - `task_rms_norm_f16_from_smem` (rms_norm.cuh) — relied on bf16x2 intrinsics
+   - `ldwarp_execute_singlethread` (TMA load pipeline, ldwarp.cuh)
+   - `stwarp_execute_singlethread` (TMA store pipeline, stwarp.cuh)
+   - `create_tma_descriptor` (host, runtime.cu) — returns zero-init descriptor
+
+## What's left to make it functional (not just compile)
+
+Replace each stub above with a real AMD implementation:
+
+| Stub | What to write |
+|---|---|
+| `ldwarp_execute_singlethread` | `__builtin_amdgcn_global_load_lds` plus a `__shared__` atomic counter for the "tx complete" handshake. CDNA3 has the LDS DMA, just not as a high-level descriptor. |
+| `stwarp_execute_singlethread` | Plain wave-cooperative store loops (`ds_read` / global write). No bulk-store equivalent. |
+| `task_gemm` (WGMMA) | MFMA intrinsics (`__builtin_amdgcn_mfma_f32_*`). Layout differs from WGMMA — A/B fragments are 16-wide on CDNA3. |
+| `task_gemv*` | Same MFMA idea, narrow N. |
+| `task_attention_fwd_flash3_*` | Either rebuild on MFMA or call rocBLAS / Composable Kernel. The flash3 control flow (split-K, post-reduce) can be reused. |
+| `task_silu_smem*`, `task_rope_interleaved` | Hand-roll without CuTe layouts. These don't need MMA, they're just elementwise + reduce. |
+| `task_rms_norm_f16_from_smem` | Same — write a bf16 path using fp32 reductions and `hip_bfloat16` element conversion. No bf16x2 vector unit on MI300X exposed via intrinsics. |
+| `create_tma_descriptor` | No-op or remove entirely. Replace TMA opcodes in `compute_dispatch.cuh` with `hipMemcpyAsync` + LDS staging on the AMD path. |
+| `cuda::barrier` shim | Validate correctness under contention (currently the `s_sleep(1)` poll is fine; sanity-test the phase rollover). |
+
+## Estimated effort
+
+- **rms_norm + silu + rope** (no MMA): a couple of days each. These unblock pre-/post-attention pipeline.
+- **rocBLAS-based gemm + attention** (skip MFMA hand-rolling): ~1 week — gives correct results but loses the VDCores DAE pipeline overlap.
+- **MFMA-based gemm + flash-attention rewrite**: 3–4 weeks for parity with the Hopper version.
+- **TMA → LDS-DMA pipeline**: 1–2 weeks; the trickiest because the whole VDCores model assumes async TMA.
+
+## Build & verify
 
 ```bash
-git checkout hip-port
-module load rocm/6.2.1
-cd app/hip && make run         # Standalone demo (works today)
-cd ../..  && make HIP=1 pyext  # Full runtime build (will fail with the items above)
+# Setup (only needed once on a node without /opt/rocm-6.2.1):
+source /scratch/general/vast/u1418973/vdcores/miniconda3/etc/profile.d/conda.sh
+conda create -n hip -c conda-forge -y hipcc rocm-device-libs    # ~5 min
+conda activate hip
+unset CXXFLAGS CFLAGS CPPFLAGS LDFLAGS
+
+# Standalone demo:
+cd /scratch/general/vast/u1418973/vdcores/app/hip && make
+./vdcores_hip_demo            # needs an AMD GPU; on Hopper-only nodes this will report "no ROCm-capable device"
+
+# Full runtime object (compiles anywhere with hipcc):
+cd /scratch/general/vast/u1418973/vdcores
+make HIP=1 runtime.o          # produces a 26KB ELF for gfx942
+
+# pyext (PyTorch bindings) — torch_runtime.cu still needs TMA-byte input handling
+# stubbed before this will succeed end-to-end.
+make HIP=1 pyext              # not yet
 ```

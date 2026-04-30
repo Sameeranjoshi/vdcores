@@ -6,6 +6,22 @@
 #include "context.cuh"
 
 // macros for runtime
+#ifdef __HIP_PLATFORM_AMD__
+// AMD CDNA3 has no per-id named bar.sync; we degrade to a CTA-wide barrier.
+// This is correct (just less granular) and avoids inline-PTX entirely.
+template<int BarrierID, int Count>
+__device__ __forceinline__ void __sync_barrier() { __syncthreads(); }
+template<int Count>
+__device__ __forceinline__ void __sync_barrier(int BarrierID) { __syncthreads(); }
+
+__device__ __forceinline__ int load_l2(const int* addr) {
+    return __builtin_nontemporal_load(addr);
+}
+template<typename T>
+__device__ __forceinline__ void prefetch_l1(const T* addr) {
+    __builtin_prefetch(reinterpret_cast<const void*>(addr));
+}
+#else
 template<int BarrierID, int Count>
 __device__ __forceinline__ void __sync_barrier() {
     asm volatile(
@@ -41,6 +57,7 @@ __device__ __forceinline__ void prefetch_l1(const T* addr) {
         :
         : "l"(addr));
 }
+#endif
 
 #define __compute_tid() (threadIdx.x)
 #define __memory_tid() cuda::ptx::get_sreg_laneid()

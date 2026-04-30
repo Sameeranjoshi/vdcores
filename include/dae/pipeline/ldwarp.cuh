@@ -2,6 +2,16 @@
 
 #include "virtualcore.cuh"
 
+#ifdef __HIP_PLATFORM_AMD__
+// AMD STUB: TMA load pipeline. Hopper TMA has no CDNA3 equivalent. Replace with
+// __builtin_amdgcn_global_load_lds + barrier coordination on AMD.
+template <typename M2LD_Type, typename M2C_Type>
+__device__ __forceinline__ void ldwarp_execute_singlethread(
+    M2LD_Type&, M2C_Type&, const MInst*, const void*, const CUtensorMap*, int*) {
+  __builtin_trap();
+}
+#else
+
 template<typename M2LD_Type, typename M2C_Type>
 __device__ __forceinline__ void ldwarp_execute_singlethread(
     M2LD_Type &m2ld, M2C_Type &m2c,
@@ -192,3 +202,5 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
   __ldprint("End of LD warp execution");
   // __print(0, "End of LD warp execution");
 }
+
+#endif  // __HIP_PLATFORM_AMD__

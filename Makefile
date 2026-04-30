@@ -12,7 +12,8 @@ ifeq ($(HIP),1)
   HIP_ARCH ?= gfx942
   CUDA_ARCH = --offload-arch=$(HIP_ARCH)
   LDFLAGS = -lamdhip64
-  NVCC_FLAGS = -O3 -Iinclude/dae -Iinclude -I$(GENERATED_INCLUDE_DIR) -std=c++20 -D__HIP_PLATFORM_AMD__
+  NVCC_FLAGS = -O3 -Iinclude/dae -Iinclude -I$(GENERATED_INCLUDE_DIR) -std=c++20 -D__HIP_PLATFORM_AMD__ -D__AMDGCN_WAVEFRONT_SIZE=64 -fPIC
+  PIC_FLAG :=
 else
   # ---- NVIDIA CUDA path ----
   NVCC = nvcc
@@ -20,6 +21,7 @@ else
   CUDA_ARCH = -gencode arch=compute_90a,code=sm_90a
   LDFLAGS = -lcuda -lcublas
   NVCC_FLAGS = -O3 -Iinclude/dae -Iinclude -I$(GENERATED_INCLUDE_DIR) -std=c++20 -Xptxas=-v -use_fast_math -lineinfo
+  PIC_FLAG := -Xcompiler -fPIC
 endif
 
 GENERATED_INCLUDE_DIR := build/generated
@@ -75,7 +77,7 @@ $(COMPUTE_OP_GENERATED_STAMP): FORCE $(COMPUTE_OP_GENERATOR) $(COMPUTE_DISPATCH)
 $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS): $(COMPUTE_OP_GENERATED_STAMP)
 
 runtime.o: src/runtime.cu $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS) $(HEADERS)
-	$(NVCC) $(CUDA_ARCH) $(NVCC_FLAGS) -Xcompiler -fPIC -c -o $@ $<
+	$(NVCC) $(CUDA_ARCH) $(NVCC_FLAGS) $(PIC_FLAG) -c -o $@ $<
 
 %: $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS)
 

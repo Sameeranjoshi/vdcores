@@ -2,8 +2,7 @@
 
 #include <cstdint>
 #include <hip/hip_runtime.h>
-#include <cuda/barrier>
-#include <cuda/ptx>
+#include "dae/hip_compat.cuh"
 
 // features
 constexpr bool dae2EnableLooping = true;

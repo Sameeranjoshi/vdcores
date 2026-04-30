@@ -8,8 +8,7 @@
 #include "compute_dispatch.cuh"
 
 #include <hip/hip_runtime.h>
-#include <cuda/barrier>
-#include <cuda/ptx>
+#include "dae/hip_compat.cuh"
 #include <bit>
 
 // pipeline stages

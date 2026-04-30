@@ -2,6 +2,8 @@
 #include "runtime.cuh"
 
 #include <hip/hip_runtime.h>
+#include <iostream>
+#include <array>
 
 size_t set_smem_size(size_t smem_size) {
     hipError_t err = hipFuncSetAttribute(reinterpret_cast<const void*>(dae2),
@@ -41,6 +43,22 @@ hipError_t launch_dae(
   return hipGetLastError();
 }
 
+#ifdef __HIP_PLATFORM_AMD__
+// AMD STUB: TMA descriptors don't exist on CDNA3.
+CUtensorMap create_tma_descriptor(
+  CUtensorMapDataType,
+  int,
+  void *,
+  std::array<uint64_t, 5>,
+  std::array<uint32_t, 5>,
+  CUtensorMapSwizzle,
+  std::array<uint64_t, 5>
+) {
+  CUtensorMap desc{};
+  std::cerr << "[VDCores][HIP] create_tma_descriptor called: TMA not supported on AMD\n";
+  return desc;
+}
+#else
 CUtensorMap create_tma_descriptor(
   CUtensorMapDataType data_type,
   int dims,
@@ -101,6 +119,7 @@ CUtensorMap create_tma_descriptor(
     CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE // No special OOB handling
   );
   assert(result == hipSuccess && "Failed to create tensor map");
-  
+
   return desc;
 }
+#endif  // __HIP_PLATFORM_AMD__

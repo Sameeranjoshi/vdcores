@@ -3,6 +3,15 @@
 
 #include "virtualcore.cuh"
 
+#ifdef __HIP_PLATFORM_AMD__
+// AMD STUB: TMA store pipeline. cp_async_bulk has no CDNA3 equivalent.
+template <typename C2M_Type>
+__device__ __forceinline__ void stwarp_execute_singlethread(
+    C2M_Type&, const MInst*, const void*, const CUtensorMap*, int*) {
+  __builtin_trap();
+}
+#else
+
 // TODO(zhiyuang): attach bars to the writeback
 template<typename C2M_Type>
 __device__ __forceinline__ void stwarp_execute_singlethread(
@@ -176,3 +185,5 @@ __device__ __forceinline__ void stwarp_execute_singlethread(
 
   __stprint("End of ST warp execution");
 }
+
+#endif  // __HIP_PLATFORM_AMD__
