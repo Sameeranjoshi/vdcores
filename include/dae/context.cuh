@@ -1,7 +1,7 @@
 #pragma once
 
 #include <cstdint>
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 #include <cuda/barrier>
 #include <cuda/ptx>
 

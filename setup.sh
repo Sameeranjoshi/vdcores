@@ -1,7 +1,7 @@
-wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-$(uname -m).sh -O miniconda.sh
-bash miniconda.sh -b -f
+wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-$(uname -m).sh -O /scratch/general/vast/u1418973/vdcores/miniconda.sh
+bash /scratch/general/vast/u1418973/vdcores/miniconda.sh -b -f
 
-~/miniconda3/bin/conda init bash
+/scratch/general/vast/u1418973/vdcores/miniconda3/bin/conda init bash
 source ~/.bashrc
 
 conda activate

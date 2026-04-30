@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 // runtime structures used for computation and memory virtual cores
 
 #pragma once

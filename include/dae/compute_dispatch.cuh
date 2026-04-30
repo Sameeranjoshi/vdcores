@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 #pragma once
 
 #include "context.cuh"
@@ -267,7 +268,7 @@ DAE_COMPUTE_OP_HANDLER(OP_SILU_MUL_SHARED_BF16_K_64_SW128) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, scratch_space, st_insts, g_events);
   const int num_token = inst.args[0];
   auto layout_sv = tile_to_shape(
-    GMMA::Layout_MN_SW128_Atom<__nv_bfloat162>{},
+    GMMA::Layout_MN_SW128_Atom<__hip_bfloat162>{},
     make_shape(Int<32>{}, num_token)
   );
   task_silu_smem<64>(num_token, layout_sv, smem_base, m2c, c2m);
@@ -275,10 +276,10 @@ DAE_COMPUTE_OP_HANDLER(OP_SILU_MUL_SHARED_BF16_K_64_SW128) {
 
 DAE_COMPUTE_OP_HANDLER(OP_RMS_NORM_F16_K_4096_SMEM) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, g_events);
-  task_rms_norm_f16_from_smem<4096, __nv_bfloat16>(
+  task_rms_norm_f16_from_smem<4096, __hip_bfloat16>(
     smem_base,
     inst.args[0],
-    *reinterpret_cast<const __nv_bfloat16 *>(inst.args + 1),
+    *reinterpret_cast<const __hip_bfloat16 *>(inst.args + 1),
     (float *)scratch_space,
     m2c,
     c2m
@@ -287,10 +288,10 @@ DAE_COMPUTE_OP_HANDLER(OP_RMS_NORM_F16_K_4096_SMEM) {
 
 DAE_COMPUTE_OP_HANDLER(OP_RMS_NORM_F16_K_2048_SMEM) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, g_events);
-  task_rms_norm_f16_from_smem<2048, __nv_bfloat16>(
+  task_rms_norm_f16_from_smem<2048, __hip_bfloat16>(
     smem_base,
     inst.args[0],
-    *reinterpret_cast<const __nv_bfloat16 *>(inst.args + 1),
+    *reinterpret_cast<const __hip_bfloat16 *>(inst.args + 1),
     (float *)scratch_space,
     m2c,
     c2m
@@ -299,10 +300,10 @@ DAE_COMPUTE_OP_HANDLER(OP_RMS_NORM_F16_K_2048_SMEM) {
 
 DAE_COMPUTE_OP_HANDLER(OP_RMS_NORM_F16_K_5120_SMEM) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, g_events);
-  task_rms_norm_f16_from_smem<5120, __nv_bfloat16>(
+  task_rms_norm_f16_from_smem<5120, __hip_bfloat16>(
     smem_base,
     inst.args[0],
-    *reinterpret_cast<const __nv_bfloat16 *>(inst.args + 1),
+    *reinterpret_cast<const __hip_bfloat16 *>(inst.args + 1),
     (float *)scratch_space,
     m2c,
     c2m
@@ -311,10 +312,10 @@ DAE_COMPUTE_OP_HANDLER(OP_RMS_NORM_F16_K_5120_SMEM) {
 
 DAE_COMPUTE_OP_HANDLER(OP_RMS_NORM_F16_K_128_SMEM) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, st_insts, g_events);
-  task_rms_norm_f16_from_smem<128, __nv_bfloat16>(
+  task_rms_norm_f16_from_smem<128, __hip_bfloat16>(
     smem_base,
     inst.args[0],
-    *reinterpret_cast<const __nv_bfloat16 *>(inst.args + 1),
+    *reinterpret_cast<const __hip_bfloat16 *>(inst.args + 1),
     (float *)scratch_space,
     m2c,
     c2m
@@ -323,22 +324,22 @@ DAE_COMPUTE_OP_HANDLER(OP_RMS_NORM_F16_K_128_SMEM) {
 
 DAE_COMPUTE_OP_HANDLER(OP_ARGMAX_PARTIAL_bf16_1152_50688_132) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
-  task_argmax_partial<1152, 50688, 132, __nv_bfloat16>(inst.args[0], smem_base, st_insts, (void *)scratch_space, m2c, c2m);
+  task_argmax_partial<1152, 50688, 132, __hip_bfloat16>(inst.args[0], smem_base, st_insts, (void *)scratch_space, m2c, c2m);
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_ARGMAX_REDUCE_bf16_1152_132) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
-  task_argmax_reduce_kernel<1152, 132, __nv_bfloat16>(inst.args[0], smem_base, st_insts, (void *)scratch_space, m2c, c2m);
+  task_argmax_reduce_kernel<1152, 132, __hip_bfloat16>(inst.args[0], smem_base, st_insts, (void *)scratch_space, m2c, c2m);
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_ARGMAX_PARTIAL_bf16_1024_65536_128) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
-  task_argmax_partial<1024, 65536, 128, __nv_bfloat16>(inst.args[0], smem_base, st_insts, (void *)scratch_space, m2c, c2m);
+  task_argmax_partial<1024, 65536, 128, __hip_bfloat16>(inst.args[0], smem_base, st_insts, (void *)scratch_space, m2c, c2m);
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_ARGMAX_REDUCE_bf16_1024_128) {
   DAE_UNUSED(sm_id, thread_id, pc, count, finish, g_events);
-  task_argmax_reduce_kernel<1024, 128, __nv_bfloat16>(inst.args[0], smem_base, st_insts, (void *)scratch_space, m2c, c2m);
+  task_argmax_reduce_kernel<1024, 128, __hip_bfloat16>(inst.args[0], smem_base, st_insts, (void *)scratch_space, m2c, c2m);
 }
 
 DAE_COMPUTE_OP_HANDLER(OP_ROPE_INTERLEAVE_512) {

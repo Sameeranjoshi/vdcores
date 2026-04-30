@@ -1,12 +1,12 @@
 #pragma once
 
 #include "context.cuh"
-#include <cuda.h>
+#include <hip/hip_runtime.h>
 
 // runtime interface for DAE kernels
 size_t set_smem_size(size_t smem_size = (1024 * 212));
 
-cudaError_t launch_dae(
+hipError_t launch_dae(
   int numSMs,
   size_t smem_size,
   CInst* compute_instructions,

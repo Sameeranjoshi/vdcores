@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 #pragma once
 
 #include <cmath>
@@ -55,7 +56,7 @@ struct NormRope {
             float sum = 0.0f;
             #pragma unroll
             for (int i = lane_in_one_token; i < num_thread_per_token; i += num_thread_per_token) {
-                __nv_bfloat162 val = input(r, i);
+                __hip_bfloat162 val = input(r, i);
                 float2 val_f32 = __bfloat1622float2(val);
                 sum += val_f32.x * val_f32.x + val_f32.y * val_f32.y;
             }
@@ -83,7 +84,7 @@ struct NormRope {
             const int logical_token_id_in_glob = token_glob_ofst + r / NUM_HEAD;
             #pragma unroll
             for (int i = lane_in_one_token; i < num_thread_per_token; i += num_thread_per_token) {
-                __nv_bfloat162 val = input(r, i);
+                __hip_bfloat162 val = input(r, i);
                 float2 val_f32 = __bfloat1622float2(val);
 
                 // apply norm
@@ -124,7 +125,7 @@ struct NormRope {
         for (int r = ofst_in_token_group; r < num_token; r += token_group_size) {
             #pragma unroll
             for (int i = lane_in_one_token; i < num_thread_per_token; i += num_thread_per_token) {
-                __nv_bfloat162 val = input(i, r);
+                __hip_bfloat162 val = input(i, r);
                 float2 val_f32 = __bfloat1622float2(val);
 
                 // apply rope
@@ -145,7 +146,7 @@ void task_rope_interleaved(
     void *base, M2CType &m2c, C2MType &c2m
 ) {
     static_assert(N % 2 == 0, "N must be even for vectorized rope");
-    using vec_t = __nv_bfloat162;
+    using vec_t = __hip_bfloat162;
 
     int thread_id = threadIdx.x;
 

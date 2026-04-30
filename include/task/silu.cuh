@@ -1,6 +1,7 @@
+#include "hip/hip_runtime.h"
 #pragma once
 
-#include <cuda.h>
+#include <hip/hip_runtime.h>
 #include <cute/tensor.hpp>
 #include <cute/arch/mma_sm80.hpp>      // SM80_16x8x16_F16F16F16F16_TN
 #include <cute/arch/mma_sm90.hpp>      // SM80_16x8x16_F16F16F16F16_TN
@@ -130,8 +131,8 @@ __device__ __forceinline__ void task_silu_smem(
     M2C_Type& m2c,
     C2M_Type& c2m
 ) {
-    using data_t = __nv_bfloat16;
-    using fetch_t = __nv_bfloat162;
+    using data_t = __hip_bfloat16;
+    using fetch_t = __hip_bfloat162;
 
     const int slot_out = m2c.pop();
     fetch_t *sOut = (fetch_t *)get_slot_address(base, extract(slot_out));
@@ -167,8 +168,8 @@ __device__ __forceinline__ void task_silu_smem_1D(
     M2C_Type& m2c,
     C2M_Type& c2m
 ) {
-    using data_t = __nv_bfloat16;
-    using fetch_t = __nv_bfloat162;
+    using data_t = __hip_bfloat16;
+    using fetch_t = __hip_bfloat162;
 
     const int slot_out = m2c.pop();
     fetch_t *sOut = (fetch_t *)get_slot_address(base, extract(slot_out));

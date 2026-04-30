@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 #pragma once
 
 #include <cmath>
@@ -954,7 +955,7 @@ __device__ __forceinline__ void task_split_post_reduce(
     constexpr int ACTIVE_THREADS   = NUM_Q * THREADS_PER_Q;
 
     using namespace cute;
-    using data_t  = __nv_bfloat16;
+    using data_t  = __hip_bfloat16;
     using accum_t = float;
     using Tr      = F16Traits<data_t>;
     using vec2_t  = typename Tr::vec2_t;

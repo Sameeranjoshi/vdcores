@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 #pragma once
 
 #include "virtualcore.cuh"
@@ -6,7 +7,7 @@
 #include "queue.cuh"
 #include "compute_dispatch.cuh"
 
-#include <cuda.h>
+#include <hip/hip_runtime.h>
 #include <cuda/barrier>
 #include <cuda/ptx>
 #include <bit>

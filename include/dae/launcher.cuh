@@ -1,8 +1,9 @@
+#include "hip/hip_runtime.h"
 #pragma once
 
 #include "runtime.cuh"
 
-#include <cuda.h>
+#include <hip/hip_runtime.h>
 #include <vector>
 #include <cstdio>
 #include <iostream>
@@ -59,13 +60,13 @@ static inline uint64_t make_cord(T1 x, T2 y, T3 z, T4 w) {
 struct CUDARAIIBuilder {
   void * d_data_ = nullptr;
   ~CUDARAIIBuilder() {
-      cudaFree(d_data_);
+      hipFree(d_data_);
   }
  protected:
   template<typename T>
   T* allocate_and_copy(void *h_data, size_t num_elements) {
-    cudaMalloc(&d_data_, sizeof(T) * num_elements);
-    cudaMemcpy(d_data_, h_data, sizeof(T) * num_elements, cudaMemcpyHostToDevice);
+    hipMalloc(&d_data_, sizeof(T) * num_elements);
+    hipMemcpy(d_data_, h_data, sizeof(T) * num_elements, hipMemcpyHostToDevice);
     return static_cast<T*>(d_data_);
   }
 };
@@ -82,8 +83,8 @@ struct SMDataBuilder : PerSMRAIIBuilder {
   SMDataBuilder(int num_sms, size_t sm_size)
   : PerSMRAIIBuilder(num_sms, sm_size) {
     h_data_ = malloc(num_sms * sm_size);
-    auto err = cudaMalloc(&d_data_, sm_size * num_sms);
-    assert(err == cudaSuccess && "Failed to allocate SM data on device");
+    auto err = hipMalloc(&d_data_, sm_size * num_sms);
+    assert(err == hipSuccess && "Failed to allocate SM data on device");
   }
   ~SMDataBuilder() { free(h_data_); }
 
@@ -100,11 +101,11 @@ struct SMDataBuilder : PerSMRAIIBuilder {
   }
   
   void* copy_to_device() {
-    cudaMemcpy(d_data_, h_data_, num_sms_ * count_per_sm_, cudaMemcpyHostToDevice);
+    hipMemcpy(d_data_, h_data_, num_sms_ * count_per_sm_, hipMemcpyHostToDevice);
     return d_data_;
   }
   void *copy_to_host() {
-    cudaMemcpy(h_data_, d_data_, num_sms_ * count_per_sm_, cudaMemcpyDeviceToHost);
+    hipMemcpy(h_data_, d_data_, num_sms_ * count_per_sm_, hipMemcpyDeviceToHost);
     return h_data_;
   }
 };
@@ -148,7 +149,7 @@ struct ProfileBuilder : PerSMRAIIBuilder {
     using PerSMRAIIBuilder::PerSMRAIIBuilder;
 
     T* copy_to_device() {
-        cudaMalloc(&d_data_, num_sms_ * count_per_sm_ * sizeof(T));
+        hipMalloc(&d_data_, num_sms_ * count_per_sm_ * sizeof(T));
         return (T*)d_data_;
     }
     
@@ -200,13 +201,13 @@ struct InstructionBuilder : PerSMRAIIBuilder {
   }
 
   T * copy_to_device() {
-    cudaMalloc(&d_data_, sizeof(T) * MAX_INSTS * num_sms_);
+    hipMalloc(&d_data_, sizeof(T) * MAX_INSTS * num_sms_);
     for (int sm = 0; sm < num_sms_; sm++) {
-      cudaMemcpy(
+      hipMemcpy(
         (T *)d_data_ + sm * MAX_INSTS,
         instructions[sm].data(),
         sizeof(T) * instructions[sm].size(),
-        cudaMemcpyHostToDevice
+        hipMemcpyHostToDevice
       );
     }
     return static_cast<T*>(d_data_);
@@ -247,25 +248,25 @@ struct DAELauncher {
     size_t smem_size = set_smem_size();
 
     int *bars;
-    cudaMalloc(&bars, sizeof(int) * 128);
+    hipMalloc(&bars, sizeof(int) * 128);
 
     auto comp_d = comp.copy_to_device();
     auto mem_d = mem.copy_to_device();
     auto tma_d = tma.copy_to_device();
     auto profile_d = profile.copy_to_device();
 
-    cudaError_t err = launch_dae(
+    hipError_t err = launch_dae(
       numSMs, smem_size,
       comp_d, mem_d, tma_d, bars,
       profile_d
     );
 
-    if (err != cudaSuccess) {
-      std::cerr << "Kernel execution failed: " << cudaGetErrorString(err) << std::endl;
+    if (err != hipSuccess) {
+      std::cerr << "Kernel execution failed: " << hipGetErrorString(err) << std::endl;
       return 1;
     }
 
-    cudaFree(bars);
+    hipFree(bars);
 
     return 0;
   }
@@ -274,17 +275,17 @@ struct DAELauncher {
     copy_to_device();
     size_t smem_size = set_smem_size();
     int *bars;
-    cudaMalloc(&bars, sizeof(int) * 128);
+    hipMalloc(&bars, sizeof(int) * 128);
 
     std::cout << "Launching DAE2 kernel with " << numSMs << " SMs, " << (32 * (numComputeWarps + 1)) << " threads per block, " << smem_size << " bytes dynamic shared memory" << std::endl;
 
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
+    hipEvent_t start, stop;
+    hipEventCreate(&start);
+    hipEventCreate(&stop);
 
     std::vector<uint64_t> profileCycles;
     
-    cudaEventRecord(start);
+    hipEventRecord(start);
     for (int i = 0; i < numRuns; i++) {
       auto comp_d = comp.copy_to_device();
       auto mem_d = mem.copy_to_device();
@@ -299,7 +300,7 @@ struct DAELauncher {
 
       for (int sm = 0; sm < numSMs; sm++) {
         uint64_t h_events[numProfileEvents];
-        cudaMemcpy(&h_events[0], profile.d_get(sm), sizeof(uint64_t) * numProfileEvents, cudaMemcpyDeviceToHost);
+        hipMemcpy(&h_events[0], profile.d_get(sm), sizeof(uint64_t) * numProfileEvents, hipMemcpyDeviceToHost);
         uint64_t start_cycle = h_events[0];
         uint64_t end_cycle = h_events[1];
         if (end_cycle <= start_cycle) {
@@ -308,11 +309,11 @@ struct DAELauncher {
         profileCycles.push_back(end_cycle - start_cycle);
       }
     }
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
+    hipEventRecord(stop);
+    hipEventSynchronize(stop);
     
     float milliseconds = 0;
-    cudaEventElapsedTime(&milliseconds, start, stop);
+    hipEventElapsedTime(&milliseconds, start, stop);
     
     // Print benchmark results
     float avgTime = milliseconds / numRuns;
@@ -330,15 +331,15 @@ struct DAELauncher {
     std::cout << "  Average time per run: " << avgNs << " ns" << std::endl;
     std::cout << "  Average Bandwidth from profile: " << (totalBytes / (avgNs / 1e9)) / (1024.0 * 1024.0 * 1024.0) << " GB/s" << std::endl;
 
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
+    hipEventDestroy(start);
+    hipEventDestroy(stop);
 
-    auto err = cudaGetLastError();
-    if (err != cudaSuccess) {
-      std::cerr << "Kernel execution failed: " << cudaGetErrorString(err) << std::endl;
+    auto err = hipGetLastError();
+    if (err != hipSuccess) {
+      std::cerr << "Kernel execution failed: " << hipGetErrorString(err) << std::endl;
       return 1;
     }
-    cudaFree(bars);
+    hipFree(bars);
 
     return 0;
   }
