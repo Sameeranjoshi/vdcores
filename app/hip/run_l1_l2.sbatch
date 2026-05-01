@@ -8,7 +8,11 @@
 #SBATCH --error=vdcores-hip-%j.err
 
 set -eo pipefail
-REPO_DIR="/work1/maryhall/sameeran/work/vdcores"
+# REPO_DIR cascade: explicit override > SLURM submit dir > hardcoded default.
+# The hardcoded default keeps the current setup working unchanged; the cascade
+# lets another contributor or relocation point at a different checkout via
+# `REPO_DIR=/path/to/repo sbatch app/hip/run_l1_l2.sbatch`.
+REPO_DIR="${REPO_DIR:-${SLURM_SUBMIT_DIR:-/work1/maryhall/sameeran/work/vdcores}}"
 cd "${REPO_DIR}/app/hip"
 
 echo "=== job ${SLURM_JOB_ID} on $(hostname) ==="
