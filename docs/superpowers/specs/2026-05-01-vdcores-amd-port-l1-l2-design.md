@@ -19,7 +19,7 @@ Build the architectural ideas of VDCores — decoupled memory/compute waves, LDS
 | Rung | Adds | Validates | Status |
 |---|---|---|---|
 | L0 | mem-wave + compute-wave + `__syncthreads` LDS handoff | DAE wave partitioning idea on AMD | ✅ already PASS on MI300X |
-| **L1** | `__builtin_amdgcn_global_load_lds` + `s_waitcnt vmcnt(0)` | AMD's TMA-equivalent async load primitive, in isolation | this spec |
+| **L1** | Explicit inline-asm `flat_load_dword` + `s_waitcnt vmcnt(0)` + `ds_write_b32` + `s_waitcnt lgkmcnt(0)` | Manual two-phase load orchestration with explicit waitcnts (the AMD memory-model dialect we'll use everywhere downstream). **Not** the TMA-equivalent async-direct path — see "Toolchain constraint" below. | this spec |
 | **L2** | LDS-counter `arrive(N) / wait_at_least(target)` queue | Replacement for `cuda::barrier` / mbarrier, in isolation | this spec |
 | L3 | 3rd wave (alloc → LD → compute → ST), double-buffer | Multi-stage pipelining; mirrors DAE topology | future spec |
 | L4 | Minimal `MInst` interpreter loop | Instruction-stream model | future spec |
@@ -229,9 +229,26 @@ All three must print `PASS`. If L1 regresses but L0 still passes, the diff betwe
 
 Each of these is fine on its own merits; none belong in v1.
 
+## Toolchain constraint (discovered during impl, 2026-05-01)
+
+Both the IR-level intrinsic and the simple inline-asm fallback turned out to be unavailable on this cluster's toolchain (ROCm 7.2 / clang-22 / gfx942):
+
+- `__builtin_amdgcn_global_load_lds(...)` — LLVM backend crashes during instruction selection: `Cannot select: intrinsic %llvm.amdgcn.global.load.lds`. The IR pattern is not wired up in this LLVM version's gfx942 backend.
+- `s_mov_b32 m0, %0` + `global_load_lds_dword %1, off` — fails with `invalid operand for instruction` because `m0` requires an SGPR while a per-lane LDS pointer resolves to a VGPR. The instruction's actual semantics use M0 as a *uniform* base LDS offset (the wave fans out automatically), so this fallback was wrong about how to use M0; a correct invocation is possible in principle but the constraint surface in clang-22 inline-asm did not yield to the obvious encodings during impl.
+
+**What L1 actually does instead.** A three-phase explicit sequence per chunk:
+
+1. Post all four `flat_load_dword` VMEM loads simultaneously into VGPRs.
+2. `s_waitcnt vmcnt(0)` — drain the VMEM pipeline.
+3. `ds_write_b32` each VGPR into its LDS slot, gated by `s_waitcnt lgkmcnt(0)`.
+
+This validates the AMD memory-model dialect we will be using everywhere downstream (explicit `s_waitcnt` discipline + inline-asm comfort) but does **not** validate a TMA-equivalent async-direct path. The data still passes through VGPRs; the only difference from L0 is that the instruction selection is explicit instead of compiler-emitted.
+
+**Implication for the staircase.** L2 builds on L1's existing load surface, so L2's claim ("validates LDS-counter queue replacement for `__syncthreads`") is unaffected. We come back to the async-direct path when (a) the ROCm/clang toolchain on the cluster gains the intrinsic, or (b) we need its perf — which won't be until L3+ when buffering matters.
+
 ## Risks and assumptions
 
-1. **`__builtin_amdgcn_global_load_lds` signature.** The exact arg order/count varies across LLVM versions. ROCm 7.2 / clang-22 is what the cluster has — we'll verify against the headers during impl. If it differs from the spec, we adjust the L1 source (one site to fix). Fallback: inline-asm `global_load_lds_dword` directly. Either is acceptable on gfx942.
+1. **L1 load primitive.** Resolved (negatively) — see Toolchain constraint above. L1 uses an explicit `flat_load_dword` + `ds_write_b32` sequence rather than the originally-spec'd async-direct intrinsic. Spec has been amended to match what was actually built.
 2. **`s_waitcnt vmcnt(0)` syntax.** Inline asm string is stable on gfx942 but document a fallback to `__builtin_amdgcn_s_waitcnt(0)` (overkill but portable).
 3. **LDS-atomic visibility across waves.** `atomicAdd` on LDS is well-defined within a CTA on CDNA3; `__threadfence_block` provides the necessary release/acquire ordering. We've already used this pattern in `hip_compat.cuh` and it survives the LLVM optimiser.
 4. **The L2 spin-poll is busy-wait.** That's fine for a smoke test (one CTA, two waves). Becomes a perf concern at L3+.
