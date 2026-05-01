@@ -4,7 +4,7 @@
 //   wave 1 = "compute core" (LDS -> ALU -> LDS)
 // They communicate through shared LDS slots and a block barrier.
 //
-// Workload: c = a + b (one chunk at a time, double-buffered LDS).
+// Workload: c = a (one chunk at a time, single-buffered LDS).
 
 #include <hip/hip_runtime.h>
 #include <cmath>
@@ -49,6 +49,8 @@ void vdcores_l1_kernel(const float* __restrict__ a,
     // (global_load_lds_dword builtin crashes ROCm 7.2 backend for gfx942;
     //  spec inline-asm fallback also fails — SGPR/VGPR constraint on m0.)
     if (wave == 0) {
+      static_assert(CHUNK / WAVE == 4,
+          "flat_load/ds_write unroll assumes CHUNK/WAVE==4; update Phase 1-3 if constants change");
       // CHUNK/WAVE = 256/64 = 4 iterations per lane
       float tmp0, tmp1, tmp2, tmp3;
       typedef __attribute__((address_space(3))) float* lds_ptr_t;
