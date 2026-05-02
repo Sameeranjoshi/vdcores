@@ -23,6 +23,33 @@
     }                                                                      \
   } while (0)
 
+// ---------- L2: LDS-counter signal primitive ----------
+//
+// One LDS word per signal. Producer increments via atomicAdd; consumer spins
+// on atomic-read until the counter has reached its target. atomicAdd on LDS
+// is the bulletproof spin-poll on AMD HIP — a plain or volatile load can be
+// hoisted past s_sleep by the backend, but an atomic op is a hard memory
+// barrier that forces a fresh fetch from LDS each iteration.
+//
+struct LdsSignal {
+  unsigned counter;
+};
+
+__device__ __forceinline__
+void arrive(LdsSignal& s) {
+  if ((threadIdx.x & 63) == 0) {                 // one lane per wave signals
+    atomicAdd(&s.counter, 1u);
+    __threadfence_block();
+  }
+}
+
+__device__ __forceinline__
+void wait_at_least(LdsSignal& s, unsigned target) {
+  while (atomicAdd(&s.counter, 0u) < target) {   // atomic-read forces fresh fetch
+    __builtin_amdgcn_s_sleep(1);
+  }
+}
+
 constexpr int WAVE      = 64;     // AMD wavefront
 constexpr int CHUNK     = 256;    // floats per LDS slot
 constexpr int N_CHUNKS  = 8;      // chunks each block processes
@@ -33,14 +60,25 @@ void vdcores_l2_kernel(const float* __restrict__ a,
                        float* __restrict__ c) {
   __shared__ float lds_a[CHUNK];
   __shared__ float lds_c[CHUNK];
+  __shared__ LdsSignal loaded;     // mem-wave  → compute-wave
+  __shared__ LdsSignal computed;   // compute-wave → mem-wave (store)
 
   const int tid    = threadIdx.x;
   const int lane   = tid & (WAVE - 1);
   const int wave   = tid / WAVE;            // 0 = memory, 1 = compute
   const int base   = blockIdx.x * N_PER_BLK;
 
+  // Initialise both counters to 0 once. This __syncthreads is an init
+  // barrier, not a producer/consumer signal — we keep it.
+  if (tid == 0) {
+    loaded.counter   = 0;
+    computed.counter = 0;
+  }
+  __syncthreads();
+
   for (int chunk = 0; chunk < N_CHUNKS; ++chunk) {
     const int off = chunk * CHUNK;
+    const unsigned target = static_cast<unsigned>(chunk + 1);
 
     // memory wavefront stages a global -> LDS via explicit async load sequence.
     // Phase 1: post all VMEM loads into VGPRs (flight simultaneously).
@@ -71,24 +109,25 @@ void vdcores_l2_kernel(const float* __restrict__ a,
       asm volatile("ds_write_b32 %0, %1" :: "v"(d2), "v"(tmp2) : "memory");
       asm volatile("ds_write_b32 %0, %1" :: "v"(d3), "v"(tmp3) : "memory");
       asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+      arrive(loaded);                                    // signal 1: load done
     }
-    __syncthreads();
 
-    // compute wavefront passes data through LDS (workload is pure copy)
+    // compute wavefront waits for data, copies LDS->LDS, then signals.
     if (wave == 1) {
+      wait_at_least(loaded, target);                     // wait for signal 1
       for (int i = lane; i < CHUNK; i += WAVE) {
         lds_c[i] = lds_a[i];
       }
+      arrive(computed);                                  // signal 2: compute done
     }
-    __syncthreads();
 
-    // memory wavefront drains LDS -> global
+    // memory wavefront waits for compute, drains LDS -> global.
     if (wave == 0) {
+      wait_at_least(computed, target);                   // wait for signal 2
       for (int i = lane; i < CHUNK; i += WAVE) {
         c[base + off + i] = lds_c[i];
       }
     }
-    __syncthreads();
   }
 }
 
