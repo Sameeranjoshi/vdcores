@@ -7,7 +7,7 @@ ARCH := gfx942
 endif
 CXXFLAGS ?= -O2 -std=c++17 --offload-arch=$(ARCH) -D__AMDGCN_WAVEFRONT_SIZE=64
 
-TARGETS := vdcores_hip_demo vdcores_hip_l1 vdcores_hip_l2
+TARGETS := vdcores_hip_demo vdcores_hip_l1 vdcores_hip_l2 vdcores_hip_l3
 
 all: $(TARGETS)
 
@@ -20,6 +20,9 @@ vdcores_hip_l1: vdcores_hip_l1.cpp
 vdcores_hip_l2: vdcores_hip_l2.cpp
 	$(HIPCC) $(CXXFLAGS) -o $@ $<
 
+vdcores_hip_l3: vdcores_hip_l3.cpp
+	$(HIPCC) $(CXXFLAGS) -o $@ $<
+
 run-l0: vdcores_hip_demo
 	./vdcores_hip_demo
 
@@ -29,7 +32,10 @@ run-l1: vdcores_hip_l1
 run-l2: vdcores_hip_l2
 	./vdcores_hip_l2
 
+run-l3: vdcores_hip_l3
+	./vdcores_hip_l3
+
 clean:
 	rm -f $(TARGETS)
 
-.PHONY: all run-l0 run-l1 run-l2 clean
+.PHONY: all run-l0 run-l1 run-l2 run-l3 clean
