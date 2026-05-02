@@ -2,7 +2,7 @@
 // Targets MI300X (gfx942). Each block has two wavefronts:
 //   wave 0 = "memory core"  (global <-> LDS staging)
 //   wave 1 = "compute core" (LDS -> ALU -> LDS)
-// They communicate through shared LDS slots and a block barrier.
+// They communicate through shared LDS slots and an LDS-counter signal pair.
 //
 // Workload: c = a (one chunk at a time, single-buffered LDS).
 
@@ -38,8 +38,8 @@ struct LdsSignal {
 __device__ __forceinline__
 void arrive(LdsSignal& s) {
   if ((threadIdx.x & 63) == 0) {                 // one lane per wave signals
-    atomicAdd(&s.counter, 1u);
-    __threadfence_block();
+    __threadfence_block();                        // flush prior LDS writes
+    atomicAdd(&s.counter, 1u);                    // publish the signal
   }
 }
 
