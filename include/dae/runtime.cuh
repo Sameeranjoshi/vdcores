@@ -4,12 +4,8 @@
 #include <hip/hip_runtime.h>
 #include <array>
 
-#ifdef __HIP_PLATFORM_AMD__
-// AMD: TMA descriptor types are stubbed in hip_compat.cuh.
-using CUtensorMapDataType = int;
-using CUtensorMapSwizzle = int;
-constexpr CUtensorMapSwizzle CU_TENSOR_MAP_SWIZZLE_NONE = 0;
-#endif
+// On AMD all CUtensorMap* / cuTensorMapEncodeTiled stubs live in hip_compat.cuh
+// (which context.cuh pulls in).
 
 // runtime interface for DAE kernels
 size_t set_smem_size(size_t smem_size = (1024 * 212));

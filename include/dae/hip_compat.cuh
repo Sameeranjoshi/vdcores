@@ -28,6 +28,11 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_bfloat16.h>
+// hip_bf16.h (note the abbreviated name) provides __hip_bfloat16 / __hip_bfloat162
+// as full struct types, matching the CUDA-side leading-underscore convention.
+// Including it here makes those names available in every compile that pulls in
+// hip_compat.cuh, instead of relying on torch headers to drag it in transitively.
+#include <hip/hip_bf16.h>
 #include <cstdint>
 
 // CUDA warp-sync intrinsics -> HIP non-sync equivalents.
@@ -73,16 +78,16 @@ __device__ __forceinline__ void __nanosleep(unsigned ns) {
   (void)ns;
 }
 
-// make_bfloat162 — CUDA helper not present on AMD.
-struct __vdc_bf16x2_stub_pub { hip_bfloat16 x, y; };
-__device__ __forceinline__ __vdc_bf16x2_stub_pub make_bfloat162(hip_bfloat16 a, hip_bfloat16 b) {
-  return __vdc_bf16x2_stub_pub{a, b};
+// make_bfloat162 — CUDA helper not present on AMD. Build the native
+// __hip_bfloat162 from two halves. (ROCm 7.x already provides __hip_bfloat16
+// and __hip_bfloat162 as full struct types via amd_hip_bf16.h, so we do NOT
+// re-typedef them here.)
+__device__ __forceinline__ __hip_bfloat162 make_bfloat162(__hip_bfloat16 a, __hip_bfloat16 b) {
+  __hip_bfloat162 r;
+  r.x = a;
+  r.y = b;
+  return r;
 }
-
-// CUDA bf16 names -> HIP bf16 names. The CUDA toolkit uses leading underscores
-// (`__hip_bfloat16` was a NVIDIA convention); HIP's conda packaging drops them.
-using __hip_bfloat16  = hip_bfloat16;
-using __hip_bfloat162 = __vdc_bf16x2_stub_pub;
 
 // Minimal cute:: namespace stubs. Just enough to let dispatch.cuh declare
 // `using gemm_atom = cute::SM90_*<...>` and pass it as a template param into
@@ -121,6 +126,64 @@ using cute::tile_to_shape;
 
 // CUDA TMA descriptor type — replace with opaque stub on AMD.
 using CUtensorMap = struct { uint64_t opaque[16]; };
+
+// CUDA driver-API integer typedefs used by torch_runtime.cu's host-side
+// TMA-descriptor builder. These are CUDA-specific; on AMD nothing actually
+// reads them at runtime (cuTensorMapEncodeTiled is itself stubbed below) but
+// the source must compile.
+using cuuint32_t = uint32_t;
+using cuuint64_t = uint64_t;
+
+// CUtensorMap host-side enum stubs. Real values come from cuda.h on NVIDIA;
+// here we just need *some* names with stable integer values so switch/case
+// statements compile. The descriptor itself is never used on AMD.
+using CUtensorMapDataType    = int;
+using CUtensorMapSwizzle     = int;
+using CUtensorMapInterleave  = int;
+using CUtensorMapL2promotion = int;
+using CUtensorMapFloatOOBfill= int;
+
+enum : int {
+  CU_TENSOR_MAP_DATA_TYPE_UINT8        = 0,
+  CU_TENSOR_MAP_DATA_TYPE_UINT16       = 1,
+  CU_TENSOR_MAP_DATA_TYPE_UINT32       = 2,
+  CU_TENSOR_MAP_DATA_TYPE_INT32        = 3,
+  CU_TENSOR_MAP_DATA_TYPE_UINT64       = 4,
+  CU_TENSOR_MAP_DATA_TYPE_INT64        = 5,
+  CU_TENSOR_MAP_DATA_TYPE_FLOAT16      = 6,
+  CU_TENSOR_MAP_DATA_TYPE_FLOAT32      = 7,
+  CU_TENSOR_MAP_DATA_TYPE_BFLOAT16     = 9,
+
+  CU_TENSOR_MAP_SWIZZLE_NONE           = 0,
+  CU_TENSOR_MAP_SWIZZLE_32B            = 1,
+  CU_TENSOR_MAP_SWIZZLE_64B            = 2,
+  CU_TENSOR_MAP_SWIZZLE_128B           = 3,
+
+  CU_TENSOR_MAP_INTERLEAVE_NONE        = 0,
+  CU_TENSOR_MAP_INTERLEAVE_16B         = 1,
+  CU_TENSOR_MAP_INTERLEAVE_32B         = 2,
+
+  CU_TENSOR_MAP_L2_PROMOTION_NONE      = 0,
+  CU_TENSOR_MAP_L2_PROMOTION_L2_64B    = 1,
+  CU_TENSOR_MAP_L2_PROMOTION_L2_128B   = 2,
+  CU_TENSOR_MAP_L2_PROMOTION_L2_256B   = 3,
+
+  CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE    = 0,
+};
+
+// Host-only stub: this is called from src/runtime.cu's NVIDIA branch only,
+// but src/torch_runtime.cu calls it unconditionally on the AMD build. Returns
+// hipSuccess and zero-fills the descriptor — anything that actually consumes
+// the descriptor is itself stubbed (multi-D TMA in ldwarp/stwarp traps).
+__host__ inline hipError_t cuTensorMapEncodeTiled(
+    CUtensorMap* tma, CUtensorMapDataType, cuuint32_t,
+    void*, const cuuint64_t*, const cuuint64_t*,
+    const cuuint32_t*, const cuuint32_t*,
+    CUtensorMapInterleave, CUtensorMapSwizzle,
+    CUtensorMapL2promotion, CUtensorMapFloatOOBfill) {
+  if (tma) *tma = CUtensorMap{};
+  return hipSuccess;
+}
 
 // libcu++ tx-counting helpers used in TMA loads. Stubs that trap if reached.
 namespace cuda {
@@ -179,9 +242,13 @@ struct barrier {
   }
 
   __device__ __forceinline__ void wait(uint64_t /*token*/) {
+    // atomicAdd(p, 0) is the bulletproof spin-read on AMD HIP: a plain
+    // load (or even a volatile load) can still be hoisted past s_sleep
+    // by the backend, but an atomic op is a hard memory barrier that
+    // forces a fresh fetch from LDS on every iteration.
     auto* p = reinterpret_cast<unsigned long long*>(&state);
     while (true) {
-      unsigned long long s = *p;
+      unsigned long long s = atomicAdd(p, 0ULL);
       unsigned pending  = static_cast<unsigned>(s & 0xFFFFFFFFULL);
       unsigned expected = static_cast<unsigned>(s >> 32);
       if (pending == expected) break;  // released to next phase

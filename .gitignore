@@ -81,3 +81,17 @@ debug*.log
 inst*.txt
 inst*.dump
 *.vdcore.build
+
+# SLURM job logs
+vdcores-*.out
+vdcores-*.err
+
+# app/hip built binaries (sources end in .cpp; binaries have no extension)
+app/hip/vdcores_hip_demo
+app/hip/vdcores_hip_l1
+app/hip/vdcores_hip_l2
+app/hip/vdcores_hip_l3
+app/hip/dae_copy_smoke
+
+# local conda install — should not be in the repo
+miniconda3/

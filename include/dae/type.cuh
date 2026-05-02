@@ -35,21 +35,24 @@ struct F16Traits<cutlass::bfloat16_t> : F16Traits<__hip_bfloat16> {
 
 #else  // __HIP_PLATFORM_AMD__
 
-// AMD bf16 path: hip_bfloat16 has no vec2 / no fast f32<->bf16 vector helpers
-// in the conda-forge HIP headers. We provide a scalar-only F16Traits so kernels
-// that only need bf16<->f32 element conversion compile. Vector-bf16 paths
-// (anything using vec2_t for bf16) are stubs and will trap if exercised.
-struct __vdc_bf16x2_stub { hip_bfloat16 x, y; };
-
-template<> struct F16Traits<hip_bfloat16> {
-    using vec2_t = __vdc_bf16x2_stub;
-    static __device__ __forceinline__ float2 to_float2(__vdc_bf16x2_stub v) {
+// AMD bf16 path: ROCm 7.x exposes __hip_bfloat16 / __hip_bfloat162 (full
+// structs with .x / .y, matching the CUDA naming convention) through
+// <hip/hip_bf16.h>. We rely on those — see hip_compat.cuh for the include —
+// and provide a scalar-only F16Traits. Fast vector bf16 instructions exist on
+// CDNA but aren't wired up here; the f32<->bf16 conversions used by RMSNorm /
+// argmax go through 32-bit lanes.
+template<> struct F16Traits<__hip_bfloat16> {
+    using vec2_t = __hip_bfloat162;
+    static __device__ __forceinline__ float2 to_float2(__hip_bfloat162 v) {
         return float2{ float(v.x), float(v.y) };
     }
-    static __device__ __forceinline__ __vdc_bf16x2_stub from_float2(float2 v) {
-        return __vdc_bf16x2_stub{ hip_bfloat16(v.x), hip_bfloat16(v.y) };
+    static __device__ __forceinline__ __hip_bfloat162 from_float2(float2 v) {
+        __hip_bfloat162 r;
+        r.x = __hip_bfloat16(v.x);
+        r.y = __hip_bfloat16(v.y);
+        return r;
     }
-    static __device__ __forceinline__ float to_float(hip_bfloat16 e) {
+    static __device__ __forceinline__ float to_float(__hip_bfloat16 e) {
         return float(e);
     }
 };

@@ -85,7 +85,11 @@ run: $(BIN)
 	./$<
 
 pyext: $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS) $(TARGETS)
+ifeq ($(HIP),1)
+	HIP=1 HIP_ARCH=$(HIP_ARCH) pip install -e . --no-build-isolation
+else
 	pip install -e . --no-build-isolation
+endif
 
 FORCE:
 

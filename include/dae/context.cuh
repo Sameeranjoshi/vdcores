@@ -8,11 +8,22 @@
 constexpr bool dae2EnableLooping = true;
 constexpr bool dae2EnableGroup = true;
 constexpr bool dae2BlockingStore = false;
-constexpr bool dae2LoadInstructions = true;
 
+#ifdef __HIP_PLATFORM_AMD__
+// AMD CDNA has 64 KB LDS per workgroup vs Hopper's 228 KB. The slot pool
+// alone (24 * 8 KB = 192 KB on the NVIDIA path) doesn't fit. Drop the slot
+// count and keep instructions resident in global memory so we stay under
+// the LDS cap. Net dynamic LDS = numSlots * slotSizeKb * 1024 = 48 KB.
+constexpr bool dae2LoadInstructions = false;
+static constexpr int slotSizeKb = 8;
+static constexpr int numSlots = 6;
+static constexpr int numInsts = 4096;
+#else
+constexpr bool dae2LoadInstructions = true;
 static constexpr int slotSizeKb = 8;
 static constexpr int numSlots = 24;
 static constexpr int numInsts = dae2LoadInstructions ? 512 : 4096;
+#endif
 static constexpr int numTmas = 1024;
 static constexpr int numBars = 1024;
 

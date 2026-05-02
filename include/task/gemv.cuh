@@ -5,7 +5,7 @@
 
 #ifdef __HIP_PLATFORM_AMD__
 // AMD STUB: gemv WGMMA path. Replace with MFMA-based GEMV on CDNA3.
-template <int M, int K, int b_load_interval, bool residual, typename... Args>
+template <int M, int N, int K, typename... Args>
 __device__ __forceinline__ void task_gemv_mma(Args&&...) { __builtin_trap(); }
 template <typename Atom, int M, int K, int b_load_interval, bool residual,
           typename... Args>

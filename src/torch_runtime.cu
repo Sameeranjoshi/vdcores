@@ -127,7 +127,13 @@ static void set_persistent_cache() {
   // printf("accessPolicyMaxWindowSize: %zu bytes\n", prop.accessPolicyMaxWindowSize);
 
   const size_t set_aside = select_persisting_l2_size(prop);
+#ifdef __HIP_PLATFORM_AMD__
+  // HIP has no persisting-L2-cache limit (CDNA's L2 has no persistent-window
+  // policy). Drop silently so the rest of the launch path works.
+  (void)set_aside;
+#else
   hipDeviceSetLimit(cudaLimitPersistingL2CacheSize, set_aside);
+#endif
   // printf("persistentCacheSize: %zu bytes\n", set_aside);
 }
 
@@ -293,6 +299,12 @@ enum CachePolicy : int {
 
 // Set cache policy for a CUDA tensor on the specified stream.
 void py_reset_cache_policy(int64_t stream_id) {
+#ifdef __HIP_PLATFORM_AMD__
+  // hipStreamSetAttribute is not exported by torch+rocm 6.4's bundled HIP
+  // runtime (it's a 7.x addition). The access-policy window is a perf hint;
+  // dropping it costs nothing for correctness.
+  (void)stream_id;
+#else
   hipStream_t stream = reinterpret_cast<hipStream_t>(stream_id);
   hipLaunchAttributeValue attr{};
   attr.accessPolicyWindow.base_ptr = nullptr;
@@ -302,6 +314,7 @@ void py_reset_cache_policy(int64_t stream_id) {
   attr.accessPolicyWindow.missProp = hipAccessPropertyNormal;
   auto err = hipStreamSetAttribute(stream, hipLaunchAttributeAccessPolicyWindow, &attr);
   TORCH_CHECK(err == hipSuccess, "hipStreamSetAttribute reset failed: ", hipGetErrorString(err));
+#endif
 }
 
 void py_tensor_set_cache_policy(
@@ -315,6 +328,11 @@ void py_tensor_set_cache_policy(
   TORCH_CHECK(t.is_cuda(), "Tensor must be a CUDA tensor");
   TORCH_CHECK(t.numel() > 0, "Tensor must have storage");
 
+#ifdef __HIP_PLATFORM_AMD__
+  // No hipStreamSetAttribute in torch+rocm 6.4's bundled runtime; same
+  // reasoning as py_reset_cache_policy above. Drop the hint silently.
+  (void)stream_id; (void)hit_ratio; (void)hit_policy; (void)miss_policy; (void)num_bytes;
+#else
   // Get the current CUDA stream
   hipStream_t stream = reinterpret_cast<hipStream_t>(stream_id);
 
@@ -341,6 +359,7 @@ void py_tensor_set_cache_policy(
   attr.accessPolicyWindow = apw;
   auto err = hipStreamSetAttribute(stream, hipLaunchAttributeAccessPolicyWindow, &attr);
   TORCH_CHECK(err == hipSuccess, "hipStreamSetAttribute failed: ", hipGetErrorString(err));
+#endif
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
