@@ -78,7 +78,7 @@ Workload simplified to `c = a` (pure copy — no compute work). Cross-wave sync 
 make run-l1
 ```
 
-Expected: `[vdcores-hip-l1] N=32768 blocks=16 threads/block=128 errors=0 PASS`
+Expected: `[vdcores-hip-l1] N=32768 blocks=16 threads/block=128  errors=0  PASS`
 
 ### L2 — `vdcores_hip_l2`
 
@@ -88,7 +88,7 @@ Same load surface as L1. The three cross-wave `__syncthreads` calls are replaced
 make run-l2
 ```
 
-Expected: `[vdcores-hip-l2] N=32768 blocks=16 threads/block=128 errors=0 PASS`
+Expected: `[vdcores-hip-l2] N=32768 blocks=16 threads/block=128  errors=0  PASS`
 
 ### Running all three on MI300X via SLURM
 
