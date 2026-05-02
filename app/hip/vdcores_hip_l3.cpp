@@ -55,24 +55,26 @@ constexpr int CHUNK     = 256;    // floats per LDS slot
 constexpr int N_CHUNKS  = 8;      // chunks each block processes
 constexpr int N_PER_BLK = CHUNK * N_CHUNKS;
 
-__global__ __launch_bounds__(2 * WAVE)
+__global__ __launch_bounds__(3 * WAVE)
 void vdcores_l3_kernel(const float* __restrict__ a,
                        float* __restrict__ c) {
   __shared__ float lds_a[CHUNK];
   __shared__ float lds_c[CHUNK];
-  __shared__ LdsSignal loaded;     // mem-wave  → compute-wave
-  __shared__ LdsSignal computed;   // compute-wave → mem-wave (store)
+  __shared__ LdsSignal loaded;     // LD wave  → compute wave
+  __shared__ LdsSignal computed;   // compute  → ST wave
+  __shared__ LdsSignal stored;     // ST       → LD wave (closes ring; gates slot reuse)
 
   const int tid    = threadIdx.x;
   const int lane   = tid & (WAVE - 1);
-  const int wave   = tid / WAVE;            // 0 = memory, 1 = compute
+  const int wave   = tid / WAVE;            // 0 = LD, 1 = compute, 2 = ST
   const int base   = blockIdx.x * N_PER_BLK;
 
-  // Initialise both counters to 0 once. This __syncthreads is an init
-  // barrier, not a producer/consumer signal — we keep it.
+  // Initialise all three counters to 0 once. This __syncthreads is an
+  // init barrier, not a producer/consumer signal — we keep it.
   if (tid == 0) {
     loaded.counter   = 0;
     computed.counter = 0;
+    stored.counter   = 0;
   }
   __syncthreads();
 
@@ -80,13 +82,14 @@ void vdcores_l3_kernel(const float* __restrict__ a,
     const int off = chunk * CHUNK;
     const unsigned target = static_cast<unsigned>(chunk + 1);
 
-    // memory wavefront stages a global -> LDS via explicit async load sequence.
+    // wave 0 (LD): wait for the slot to be free (prev ST done), then async-load.
+    // (global_load_lds_dword builtin crashes ROCm 7.2 backend for gfx942;
+    //  spec inline-asm fallback also fails — SGPR/VGPR constraint on m0.)
     // Phase 1: post all VMEM loads into VGPRs (flight simultaneously).
     // Phase 2: s_waitcnt vmcnt(0) — drain the VMEM pipeline.
     // Phase 3: ds_write_b32 each VGPR into its LDS slot.
-    // (global_load_lds_dword builtin crashes ROCm 7.2 backend for gfx942;
-    //  spec inline-asm fallback also fails — SGPR/VGPR constraint on m0.)
     if (wave == 0) {
+      wait_at_least(stored, static_cast<unsigned>(chunk));   // gate on slot reuse
       static_assert(CHUNK / WAVE == 4,
           "flat_load/ds_write unroll assumes CHUNK/WAVE==4; update Phase 1-3 if constants change");
       // CHUNK/WAVE = 256/64 = 4 iterations per lane
@@ -109,24 +112,26 @@ void vdcores_l3_kernel(const float* __restrict__ a,
       asm volatile("ds_write_b32 %0, %1" :: "v"(d2), "v"(tmp2) : "memory");
       asm volatile("ds_write_b32 %0, %1" :: "v"(d3), "v"(tmp3) : "memory");
       asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
-      arrive(loaded);                                    // signal 1: load done
+      arrive(loaded);                                        // signal: load done
     }
 
-    // compute wavefront waits for data, copies LDS->LDS, then signals.
+    // wave 1 (compute): wait for data, copy LDS->LDS, signal compute done.
     if (wave == 1) {
-      wait_at_least(loaded, target);                     // wait for signal 1
+      wait_at_least(loaded, target);
       for (int i = lane; i < CHUNK; i += WAVE) {
         lds_c[i] = lds_a[i];
       }
-      arrive(computed);                                  // signal 2: compute done
+      arrive(computed);
     }
 
-    // memory wavefront waits for compute, drains LDS -> global.
-    if (wave == 0) {
-      wait_at_least(computed, target);                   // wait for signal 2
+    // wave 2 (ST): wait for compute, drain LDS -> global, signal store done
+    // so wave 0 can reuse the slot for chunk+1.
+    if (wave == 2) {
+      wait_at_least(computed, target);
       for (int i = lane; i < CHUNK; i += WAVE) {
         c[base + off + i] = lds_c[i];
       }
+      arrive(stored);
     }
   }
 }
@@ -150,7 +155,7 @@ int main() {
 
   HIP_CHECK(hipMemcpyAsync(da, ha.data(), BYTES, hipMemcpyHostToDevice, stream));
 
-  dim3 grid(N_BLOCKS), block(2 * WAVE);
+  dim3 grid(N_BLOCKS), block(3 * WAVE);
   hipLaunchKernelGGL(vdcores_l3_kernel, grid, block, 0, stream, da, dc);
 
   HIP_CHECK(hipMemcpyAsync(hc.data(), dc, BYTES, hipMemcpyDeviceToHost, stream));
@@ -162,7 +167,7 @@ int main() {
     if (std::fabs(hc[i] - ref) > 1e-5f) ++errors;
   }
   std::printf("[vdcores-hip-l3] N=%d blocks=%d threads/block=%d  errors=%d  %s\n",
-              N, N_BLOCKS, 2 * WAVE, errors, errors ? "FAIL" : "PASS");
+              N, N_BLOCKS, 3 * WAVE, errors, errors ? "FAIL" : "PASS");
 
   hipStreamDestroy(stream);
   hipFree(da); hipFree(dc);
