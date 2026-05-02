@@ -90,10 +90,22 @@ make run-l2
 
 Expected: `[vdcores-hip-l2] N=32768 blocks=16 threads/block=128  errors=0  PASS`
 
-### Running all three on MI300X via SLURM
+### L3 — `vdcores_hip_l3`
+
+Same load surface and queue primitive as L2, but the `mem` wave is split: wave 0 is now LD-only, wave 2 is the new ST wave, and a third `LdsSignal` (`stored`) closes the producer/consumer ring so wave 0 can't overwrite a slot that wave 2 is still draining. Block size is now `3 * WAVE = 192` threads per CTA.
+
+Validates that 3 wavefronts cooperate cleanly in one CTA on AMD wave64 — i.e. the alloc+ST shared-wavefront hazard from the megakernel port is structurally absent here. Workload still `c = a`; still single buffer (overlap arrives at L4).
 
 ```bash
-sbatch run_l1_l2.sbatch
+make run-l3
 ```
 
-The job builds whichever sources are present and runs each binary under a 10s timeout. All three lines should print `errors=0 PASS`.
+Expected: `[vdcores-hip-l3] N=32768 blocks=16 threads/block=192  errors=0  PASS`
+
+### Running the staircase on MI300X via SLURM
+
+```bash
+sbatch run_staircase.sbatch
+```
+
+The job builds whichever sources are present and runs each binary under a 10s timeout. All four (L0/L1/L2/L3) lines should print `errors=0 PASS`.
