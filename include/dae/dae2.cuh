@@ -130,8 +130,11 @@ void dae2(
 
   __shared__ DaeAmdSignal load_done;
   __shared__ DaeAmdSignal store_done;
-  // Single-buffer LDS slot. slotSizeKb=8 on AMD; use a fixed 8 KiB chunk.
-  __shared__ alignas(16) uint8_t lds_slot[slotSizeKb * 1024];
+  // Single-buffer LDS staging slot for the AMD interpreter. Sized via
+  // daeAmdStagingBytes (16 KB) so it fits the largest workload chunk we
+  // care about (tmacopy.py uses 16 KB loads). Independent of the Python
+  // slot pool — see context.cuh for the full LDS budget breakdown.
+  __shared__ alignas(16) uint8_t lds_slot[daeAmdStagingBytes];
 
   if (tid == 128) {
     load_done.counter = 0;

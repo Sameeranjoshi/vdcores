@@ -11,13 +11,20 @@ constexpr bool dae2BlockingStore = false;
 
 #ifdef __HIP_PLATFORM_AMD__
 // AMD CDNA has 64 KB LDS per workgroup vs Hopper's 228 KB. The slot pool
-// alone (24 * 8 KB = 192 KB on the NVIDIA path) doesn't fit. Drop the slot
-// count and keep instructions resident in global memory so we stay under
-// the LDS cap. Net dynamic LDS = numSlots * slotSizeKb * 1024 = 48 KB.
+// alone (24 * 8 KB = 192 KB on the NVIDIA path) doesn't fit. The AMD
+// interpreter uses its own static LDS staging buffer (daeAmdStagingBytes)
+// in addition to the dynamic pool reserved by the Python launcher. Total
+// LDS budget per workgroup must stay under 64 KB:
+//   dynamic = numSlots * slotSizeKb * 1024  +  4 KB slack (set in launcher.py)
+//   static  = daeAmdStagingBytes
+// With numSlots=4, slotSizeKb=8, daeAmdStagingBytes=16K:
+//   32 KB dyn + 4 KB slack + 16 KB static = 52 KB  (fits, ~12 KB margin).
 constexpr bool dae2LoadInstructions = false;
 static constexpr int slotSizeKb = 8;
-static constexpr int numSlots = 6;
+static constexpr int numSlots = 4;
 static constexpr int numInsts = 4096;
+// AMD interpreter staging slot. 16 KB covers tmacopy.py (16 KB chunks).
+static constexpr int daeAmdStagingBytes = 16 * 1024;
 #else
 constexpr bool dae2LoadInstructions = true;
 static constexpr int slotSizeKb = 8;
