@@ -130,7 +130,8 @@ void dae2(
   enum ComputeMode : uint8_t { CMODE_NONE = 0, CMODE_SILU = 1, CMODE_MFMA = 2 };
   __shared__ uint8_t  compute_mode;
   __shared__ uint16_t silu_num_token;
-  __shared__ uint16_t mfma_k_iters;        // number of 16-wide K iterations to accumulate
+  __shared__ uint16_t mfma_k_iters;        // # of 16-wide K chunks (accumulated)
+  __shared__ uint16_t mfma_m_blocks;       // # of 16-wide M chunks (M_total = m_blocks * 16)
   __shared__ unsigned compute_progress;    // counter used by compute wave to fence its writes
 
   // AMD MFMA bf16 16x16xK matmul (K = mfma_k_iters * 16). Hijacks OP_GEMM_M64N64
@@ -147,6 +148,7 @@ void dae2(
     compute_mode = CMODE_NONE;
     silu_num_token = 0;
     mfma_k_iters = 1;     // default = 1 iteration (K=16)
+    mfma_m_blocks = 1;    // default = 1 row-block (M=16)
     compute_progress = 0;
 
     const CInst* cinsts = compute_instructions + sm_id * numInsts;
@@ -160,9 +162,11 @@ void dae2(
       }
       if (opc == OP_AMD_DEBUG_MATMUL_BF16) {
         compute_mode = CMODE_MFMA;
-        // args[0] = K_iters (# of 16-wide K chunks). Default 1 if zero.
-        uint16_t k_iters = cinsts[pc].args[0];
-        mfma_k_iters = (k_iters > 0) ? k_iters : 1;
+        // args[0] = K_iters, args[1] = M_blocks. Default to 1 each if zero.
+        uint16_t k_iters  = cinsts[pc].args[0];
+        uint16_t m_blocks = cinsts[pc].args[1];
+        mfma_k_iters  = (k_iters  > 0) ? k_iters  : 1;
+        mfma_m_blocks = (m_blocks > 0) ? m_blocks : 1;
         break;
       }
     }
@@ -220,66 +224,69 @@ void dae2(
         dae_amd_arrive(compute_done);
       }
     } else if (is_mfma_mode) {
-      // bf16 16x16xK matmul on a single wave64 wavefront via MFMA, with K
-      // accumulated across mfma_k_iters chunks of 16 (K = mfma_k_iters * 16).
-      // Inputs: slot A = A[16, K] bf16 row-major, slot B = B[K, 16] bf16
-      //         row-major.
-      // Output: D = A @ B as bf16 16x16, written back into slot A in-place.
-      // Lane mapping verified by app/hip/mfma_matmul.cpp (job 303883); the
-      // K-accumulation loop just reuses the same MFMA call, advancing the
-      // K offset on each iteration and feeding the previous fp32 accumulator
-      // back as C.
+      // bf16 (M_total x N=16) = (M_total x K_total) @ (K_total x 16) matmul,
+      // where M_total = mfma_m_blocks * 16 and K_total = mfma_k_iters * 16.
+      // Inputs: slot A = A[M_total, K_total] bf16 row-major, slot B = B[K_total, 16]
+      //         bf16 row-major.
+      // Output: D = A @ B as bf16, written into slot A in-place (the first
+      //         M_total * 16 * 2 bytes; this never overlaps the unread tail
+      //         of A as long as the full output fits below row 16 of A).
+      //
+      // K-accumulation: per row-block we chain K_iters MFMA calls, feeding
+      // the fp32 accumulator forward.
+      // M-tiling: outer loop over m_outer (0..M_blocks-1), each independent.
 
       // Wait for both inputs.
       while (atomicAdd(&load_done.counter, 0u) < 2u) {
         __builtin_amdgcn_s_sleep(1);
       }
 
-      // Only wave 0 (lanes 0..63) participates in the MFMA. Wave 1 sits idle.
+      // Only wave 0 (lanes 0..63) participates in the MFMAs. Wave 1 sits idle.
       typedef int16_t bf16x4 __attribute__((ext_vector_type(4)));
       typedef float   f32x4  __attribute__((ext_vector_type(4)));
 
-      const int K_iters = (int)mfma_k_iters;
-      const int K_total = K_iters * 16;
+      const int K_iters  = (int)mfma_k_iters;
+      const int M_blocks = (int)mfma_m_blocks;
+      const int K_total  = K_iters * 16;
 
       if (tid < 64) {
-        const int lane = tid;
-        const int kblk = lane / 16;   // 0..3 (intra-MFMA K-block, picks which 4 of 16)
-        const int row  = lane % 16;   // 0..15 (M index for A operand)
-        const int col  = lane % 16;   // 0..15 (N index for B operand)
+        const int lane     = tid;
+        const int kblk_id  = lane / 16;   // 0..3 (intra-MFMA K-block, picks which 4 of 16)
+        const int row_in16 = lane % 16;   // 0..15 (row within a 16-row tile, A operand)
+        const int col      = lane % 16;   // 0..15 (column index, B operand)
 
-        // A is row-major M=16 x K_total bf16 in slot A.
-        // B is row-major K_total x N=16 bf16 in slot B.
         const __hip_bfloat16* sA = reinterpret_cast<const __hip_bfloat16*>(lds_slot_a);
         const __hip_bfloat16* sB = reinterpret_cast<const __hip_bfloat16*>(lds_slot_b);
-
-        f32x4 acc = {0.0f, 0.0f, 0.0f, 0.0f};
-
-        for (int k_iter = 0; k_iter < K_iters; ++k_iter) {
-          const int k_base = k_iter * 16;        // K start for this MFMA
-          bf16x4 a, b;
-          for (int i = 0; i < 4; ++i) {
-            __hip_bfloat16 av = sA[row * K_total + (k_base + kblk * 4 + i)];
-            __hip_bfloat16 bv = sB[(k_base + kblk * 4 + i) * 16 + col];
-            int16_t ai, bi;
-            __builtin_memcpy(&ai, &av, sizeof(ai));
-            __builtin_memcpy(&bi, &bv, sizeof(bi));
-            a[i] = ai;
-            b[i] = bi;
-          }
-          // Feed acc back as C so MFMA does D = A*B + acc.
-          acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, acc, 0, 0, 0);
-        }
-
-        // Cast each lane's 4 fp32 outputs back to bf16 and write into slot A
-        // in row-major order. lane k holds D[(k/16)*4 + 0..3, k%16].
-        const int mblk = lane / 16;
-        const int n    = lane % 16;
         __hip_bfloat16* sOut = reinterpret_cast<__hip_bfloat16*>(lds_slot_a);
-        sOut[(mblk * 4 + 0) * 16 + n] = __hip_bfloat16(acc[0]);
-        sOut[(mblk * 4 + 1) * 16 + n] = __hip_bfloat16(acc[1]);
-        sOut[(mblk * 4 + 2) * 16 + n] = __hip_bfloat16(acc[2]);
-        sOut[(mblk * 4 + 3) * 16 + n] = __hip_bfloat16(acc[3]);
+
+        for (int m_outer = 0; m_outer < M_blocks; ++m_outer) {
+          const int m_base = m_outer * 16;
+          f32x4 acc = {0.0f, 0.0f, 0.0f, 0.0f};
+
+          for (int k_iter = 0; k_iter < K_iters; ++k_iter) {
+            const int k_base = k_iter * 16;
+            bf16x4 a, b;
+            for (int i = 0; i < 4; ++i) {
+              __hip_bfloat16 av = sA[(m_base + row_in16) * K_total + (k_base + kblk_id * 4 + i)];
+              __hip_bfloat16 bv = sB[(k_base + kblk_id * 4 + i) * 16 + col];
+              int16_t ai, bi;
+              __builtin_memcpy(&ai, &av, sizeof(ai));
+              __builtin_memcpy(&bi, &bv, sizeof(bi));
+              a[i] = ai;
+              b[i] = bi;
+            }
+            acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, acc, 0, 0, 0);
+          }
+
+          // Cast lane's 4 fp32 outputs back to bf16 in row-major.
+          // lane k holds D[m_base + (k/16)*4 + 0..3, k%16] within slot A.
+          const int row_q = lane / 16;   // 0..3 (which row-quartile of MFMA output)
+          const int n     = lane % 16;
+          sOut[(m_base + row_q * 4 + 0) * 16 + n] = __hip_bfloat16(acc[0]);
+          sOut[(m_base + row_q * 4 + 1) * 16 + n] = __hip_bfloat16(acc[1]);
+          sOut[(m_base + row_q * 4 + 2) * 16 + n] = __hip_bfloat16(acc[2]);
+          sOut[(m_base + row_q * 4 + 3) * 16 + n] = __hip_bfloat16(acc[3]);
+        }
       }
 
       // Inter-wave fence (same as SILU path) so all 128 compute threads

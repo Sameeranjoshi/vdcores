@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-# MFMA bf16 16x16xK matmul through the dae2 interpreter on AMD.
+# MFMA bf16 (M_total x N=16) = (M_total x K_total) @ (K_total x 16) matmul
+# through the dae2 interpreter on AMD.
 #
-# Tests the K-accumulation loop: each kernel runs K_iters back-to-back
-# v_mfma_f32_16x16x16bf16_1k calls, feeding the fp32 accumulator from one
-# call into the next. K = K_iters * 16. Verified against torch.matmul.
+# Tests:
+#   K-accumulation: chain K_iters MFMAs, feed fp32 accumulator forward.
+#   M-tiling:       outer loop over M_blocks 16-row tiles.
 #
-# K=16  -> 1 MFMA (single-shot, same as the original baseline)
-# K=64  -> 4 MFMAs
-# K=256 -> 16 MFMAs (matches the K dim of the upstream Gemv_M64N8 atom)
+# K = K_iters * 16, M_total = M_blocks * 16. N is fixed at 16.
+# Verified against torch.matmul.
 
 import sys
 import torch
@@ -20,20 +20,22 @@ OP_AMD_DEBUG_MATMUL_BF16 = int(op_module.OP_GEMM_M64N64)
 gpu = torch.device('cuda')
 
 
-def run_one(K_iters: int, seed: int = 0):
+def run_one(M_blocks: int, K_iters: int, seed: int = 0):
     torch.manual_seed(seed)
+    M = M_blocks * 16
     K = K_iters * 16
-    A = (torch.rand(16, K,  dtype=torch.bfloat16, device=gpu) - 0.5)
-    B = (torch.rand(K,  16, dtype=torch.bfloat16, device=gpu) - 0.5)
-    C = torch.zeros(16, 16, dtype=torch.bfloat16, device=gpu)
+    A = (torch.rand(M, K,  dtype=torch.bfloat16, device=gpu) - 0.5)
+    B = (torch.rand(K, 16, dtype=torch.bfloat16, device=gpu) - 0.5)
+    C = torch.zeros(M, 16, dtype=torch.bfloat16, device=gpu)
 
     dae = Launcher(num_sms=1, device=gpu)
 
     def task(sm: int):
         return [
-            ComputeInstruction(opcode=OP_AMD_DEBUG_MATMUL_BF16, args=[K_iters]),
-            TmaStore1D(C, bytes=16 * 16 * 2),
-            TmaLoad1D(A, bytes=16 * K * 2),
+            ComputeInstruction(opcode=OP_AMD_DEBUG_MATMUL_BF16,
+                               args=[K_iters, M_blocks]),
+            TmaStore1D(C, bytes=M * 16 * 2),
+            TmaLoad1D(A, bytes=M * K * 2),
             TmaLoad1D(B, bytes=K * 16 * 2),
         ]
 
@@ -46,24 +48,30 @@ def run_one(K_iters: int, seed: int = 0):
     return diff.max().item(), diff.mean().item(), C, ref
 
 
-print("MFMA in dae2 — K-accumulation tests")
-print("=" * 60)
+print("MFMA in dae2 — K-accumulation + M-tiling tests")
+print("=" * 70)
+
+# (M_blocks, K_iters, label, tolerance)
+cases = [
+    (1,  1, "K=16  M=16  (baseline single MFMA)",                0.02),
+    (1,  4, "K=64  M=16  (4 K-MFMAs accumulating)",              0.10),
+    (1, 16, "K=256 M=16  (16 K-MFMAs, matches Gemv_M64N8 K)",    0.50),
+    (2, 16, "K=256 M=32  (M-tiling × 2 + K=256)",                0.50),
+    (4,  8, "K=128 M=64  (M-tiling × 4 + K=128, fills slot A)",  0.50),
+]
+
 results = []
-for K_iters in [1, 4, 16]:
-    max_e, mean_e, C, ref = run_one(K_iters, seed=K_iters)
-    K = K_iters * 16
-    # bf16 final-cast tolerance grows roughly as sqrt(K) of the per-mac noise.
-    # Empirically K=256 mismatches stay well under 0.5 with random ~0.5 inputs.
-    tol = 0.5 if K_iters >= 16 else (0.1 if K_iters >= 4 else 0.02)
+for M_blocks, K_iters, label, tol in cases:
+    max_e, mean_e, C, ref = run_one(M_blocks, K_iters, seed=K_iters * 100 + M_blocks)
     ok = max_e < tol
     status = "PASS" if ok else "FAIL"
-    print(f"K={K:4d}  max_err={max_e:.6f}  mean_err={mean_e:.6f}  tol={tol:.2f}  {status}")
+    print(f"  {label:55s}  max={max_e:.6f}  mean={mean_e:.6f}  {status}")
     if not ok:
-        print(f"  C  [0,:4] = {C[0, :4].tolist()}")
-        print(f"  ref[0,:4] = {ref[0, :4].tolist()}")
+        print(f"    C  [0,:4] = {C[0, :4].tolist()}")
+        print(f"    ref[0,:4] = {ref[0, :4].tolist()}")
     results.append(ok)
 
 all_ok = all(results)
-print("=" * 60)
-print(f"mfma-dae K-accumulation: {'ALL PASS' if all_ok else 'SOME FAILED'}")
+print("=" * 70)
+print(f"mfma-dae K+M tiling: {'ALL PASS' if all_ok else 'SOME FAILED'}")
 sys.exit(0 if all_ok else 1)
