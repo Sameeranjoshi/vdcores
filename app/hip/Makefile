@@ -7,7 +7,7 @@ ARCH := gfx942
 endif
 CXXFLAGS ?= -O2 -std=c++17 --offload-arch=$(ARCH) -D__AMDGCN_WAVEFRONT_SIZE=64
 
-TARGETS := vdcores_hip_demo vdcores_hip_l1 vdcores_hip_l2 vdcores_hip_l3 dae_copy_smoke mfma_smoke
+TARGETS := vdcores_hip_demo vdcores_hip_l1 vdcores_hip_l2 vdcores_hip_l3 dae_copy_smoke mfma_smoke mfma_matmul
 
 all: $(TARGETS)
 
@@ -29,8 +29,14 @@ dae_copy_smoke: dae_copy_smoke.cpp
 mfma_smoke: mfma_smoke.cpp
 	$(HIPCC) $(CXXFLAGS) -o $@ $<
 
+mfma_matmul: mfma_matmul.cpp
+	$(HIPCC) $(CXXFLAGS) -o $@ $<
+
 run-mfma: mfma_smoke
 	./mfma_smoke
+
+run-matmul: mfma_matmul
+	./mfma_matmul
 
 run-l0: vdcores_hip_demo
 	./vdcores_hip_demo
