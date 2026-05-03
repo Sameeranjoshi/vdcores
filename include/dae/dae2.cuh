@@ -124,16 +124,27 @@ void dae2(
   // use both.
   __shared__ alignas(16) uint8_t lds_slot_a[daeAmdStagingBytes];
   __shared__ alignas(16) uint8_t lds_slot_b[daeAmdStagingBytes];
-  __shared__ bool     is_silu_mode;
+  // Compute-mode tag set by the kernel-start scan. The LD/ST waves use this
+  // to decide whether to read from slot B (multi-input ops) and whether to
+  // wait on compute_done (compute-producing ops) instead of load_done.
+  enum ComputeMode : uint8_t { CMODE_NONE = 0, CMODE_SILU = 1, CMODE_MFMA = 2 };
+  __shared__ uint8_t  compute_mode;
   __shared__ uint16_t silu_num_token;
   __shared__ unsigned compute_progress;  // counter used by compute wave to fence its writes
+
+  // AMD MFMA bf16 16x16 matmul demo: hijack OP_GEMM_M64N64 (an opcode that
+  // is in the selected compute set so the Python launcher's validation
+  // passes, but unused by any AMD-target python test today). Re-purposing
+  // it lets us exercise the full Python launcher path without adding a new
+  // op to the generated compute_opcode_order.inc.
+  constexpr uint16_t OP_AMD_DEBUG_MATMUL_BF16_16x16 = OP_GEMM_M64N64;
 
   // Init: thread 0 zeroes signals + scans cinsts for compute-op detection.
   if (tid == 0) {
     load_done.counter = 0;
     store_done.counter = 0;
     compute_done.counter = 0;
-    is_silu_mode = false;
+    compute_mode = CMODE_NONE;
     silu_num_token = 0;
     compute_progress = 0;
 
@@ -142,13 +153,21 @@ void dae2(
       uint16_t opc = cinsts[pc].opcode;
       if (opc == OP_TERMINATEC) break;
       if (opc == OP_SILU_MUL_SHARED_BF16_K_4096_INTER) {
-        is_silu_mode    = true;
+        compute_mode    = CMODE_SILU;
         silu_num_token  = cinsts[pc].args[0];
+        break;
+      }
+      if (opc == OP_AMD_DEBUG_MATMUL_BF16_16x16) {
+        compute_mode = CMODE_MFMA;
         break;
       }
     }
   }
   __syncthreads();   // all 256 threads see the init state
+  const bool is_silu_mode = (compute_mode == CMODE_SILU);
+  const bool is_mfma_mode = (compute_mode == CMODE_MFMA);
+  const bool produces_compute = (compute_mode != CMODE_NONE);
+  const bool needs_two_inputs = (compute_mode != CMODE_NONE);
 
   // ---- Compute group (threads 0..127, waves 0+1) ----
   if (tid < numComputeWarps * 32) {
@@ -186,6 +205,70 @@ void dae2(
       // Inter-wave fence inside the compute group: every compute thread bumps
       // the progress counter, then spins until all 128 have arrived. This
       // ensures slot A is fully written before we signal compute_done.
+      __threadfence_block();
+      atomicAdd(&compute_progress, 1u);
+      while (atomicAdd(&compute_progress, 0u) < (unsigned)n_compute_threads) {
+        __builtin_amdgcn_s_sleep(1);
+      }
+
+      if (tid == 0) {
+        __threadfence_block();
+        dae_amd_arrive(compute_done);
+      }
+    } else if (is_mfma_mode) {
+      // bf16 16x16x16 matmul on a single wave64 wavefront via MFMA.
+      // Inputs: slot A = A[16,16] bf16 row-major, slot B = B[16,16] bf16 row-major.
+      // Output: D = A @ B as bf16 row-major, written back into slot A in-place.
+      // Lane mapping verified by app/hip/mfma_matmul.cpp (job 303883).
+
+      // Wait for both inputs.
+      while (atomicAdd(&load_done.counter, 0u) < 2u) {
+        __builtin_amdgcn_s_sleep(1);
+      }
+
+      // Only wave 0 (lanes 0..63) participates in the MFMA. Wave 1 sits idle.
+      typedef int16_t bf16x4 __attribute__((ext_vector_type(4)));
+      typedef float   f32x4  __attribute__((ext_vector_type(4)));
+
+      if (tid < 64) {
+        const int lane = tid;
+        const int kblk = lane / 16;   // 0..3
+        const int row  = lane % 16;   // 0..15 (M index for A operand)
+        const int col  = lane % 16;   // 0..15 (N index for B operand)
+
+        // Read row-major sA / sB from LDS (each is 16x16 bf16 = 512 bytes).
+        const __hip_bfloat16* sA = reinterpret_cast<const __hip_bfloat16*>(lds_slot_a);
+        const __hip_bfloat16* sB = reinterpret_cast<const __hip_bfloat16*>(lds_slot_b);
+
+        bf16x4 a, b;
+        // Memcpy the 16-bit bit-pattern through to keep the conversion safe.
+        for (int i = 0; i < 4; ++i) {
+          __hip_bfloat16 av = sA[row * 16 + kblk * 4 + i];
+          __hip_bfloat16 bv = sB[(kblk * 4 + i) * 16 + col];
+          int16_t ai, bi;
+          __builtin_memcpy(&ai, &av, sizeof(ai));
+          __builtin_memcpy(&bi, &bv, sizeof(bi));
+          a[i] = ai;
+          b[i] = bi;
+        }
+
+        f32x4 c = {0.0f, 0.0f, 0.0f, 0.0f};
+        f32x4 d = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, c, 0, 0, 0);
+
+        // Cast each lane's 4 fp32 outputs back to bf16 and write into slot A
+        // in row-major order. lane k holds D[(k/16)*4 + 0..3, k%16].
+        const int mblk = lane / 16;
+        const int n    = lane % 16;
+        __hip_bfloat16* sOut = reinterpret_cast<__hip_bfloat16*>(lds_slot_a);
+        sOut[(mblk * 4 + 0) * 16 + n] = __hip_bfloat16(d[0]);
+        sOut[(mblk * 4 + 1) * 16 + n] = __hip_bfloat16(d[1]);
+        sOut[(mblk * 4 + 2) * 16 + n] = __hip_bfloat16(d[2]);
+        sOut[(mblk * 4 + 3) * 16 + n] = __hip_bfloat16(d[3]);
+      }
+
+      // Inter-wave fence (same as SILU path) so all 128 compute threads
+      // arrive before signaling compute_done. Wave 1 just bumps the counter.
+      const int n_compute_threads = numComputeWarps * 32;
       __threadfence_block();
       atomicAdd(&compute_progress, 1u);
       while (atomicAdd(&compute_progress, 0u) < (unsigned)n_compute_threads) {
@@ -243,15 +326,14 @@ void dae2(
     if (is_alloc_load) {
       load_seq++;
       if (wave == 2 && lane == 0) {
-        // Pick destination slot. SILU mode dual-loads into A then B. All other
-        // tests use slot A only.
-        uint8_t* slot_ptr = (is_silu_mode && load_seq == 2) ? lds_slot_b : lds_slot_a;
+        // Pick destination slot. Compute ops with two inputs dual-load into
+        // A then B; single-input tests use slot A only.
+        uint8_t* slot_ptr = (needs_two_inputs && load_seq == 2) ? lds_slot_b : lds_slot_a;
 
         // Back-pressure (single-slot reuse): wait for the prior ST to drain
-        // the slot before reusing it. SILU never reuses (1 round per kernel)
-        // so we skip the wait there; the LD wave is the only writer and
-        // overwriting is harmless.
-        if (!is_silu_mode && store_seq > 0) {
+        // the slot before reusing it. Compute-mode kernels run one round per
+        // kernel launch and don't reuse slots — skip the wait there.
+        if (!produces_compute && store_seq > 0) {
           dae_amd_wait_at_least(store_done, load_seq - 1);
         }
         const uint64_t addr = inst.address + addr_offset;
@@ -262,8 +344,9 @@ void dae2(
     } else if (is_alloc_store) {
       store_seq++;
       if (wave == 3 && lane == 0) {
-        // SILU: wait for compute to write slot A. Otherwise: wait for load.
-        if (is_silu_mode) {
+        // Compute-producing modes: wait for the compute to finish writing
+        // slot A. Pure memory-pipeline tests: wait for the matching load.
+        if (produces_compute) {
           dae_amd_wait_at_least(compute_done, store_seq);
         } else {
           dae_amd_wait_at_least(load_done, store_seq);
