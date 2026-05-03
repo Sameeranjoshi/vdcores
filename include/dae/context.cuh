@@ -16,14 +16,17 @@ constexpr bool dae2BlockingStore = false;
 // in addition to the dynamic pool reserved by the Python launcher. Total
 // LDS budget per workgroup must stay under 64 KB:
 //   dynamic = numSlots * slotSizeKb * 1024  +  4 KB slack (set in launcher.py)
-//   static  = daeAmdStagingBytes
-// With numSlots=4, slotSizeKb=8, daeAmdStagingBytes=16K:
-//   32 KB dyn + 4 KB slack + 16 KB static = 52 KB  (fits, ~12 KB margin).
+//   static  = 2 * daeAmdStagingBytes        (slot A + slot B)
+// With numSlots=2, slotSizeKb=8, daeAmdStagingBytes=16K:
+//   16 KB dyn + 4 KB slack + 32 KB static = 52 KB  (fits, ~12 KB margin).
 constexpr bool dae2LoadInstructions = false;
 static constexpr int slotSizeKb = 8;
-static constexpr int numSlots = 4;
+static constexpr int numSlots = 2;
 static constexpr int numInsts = 4096;
-// AMD interpreter staging slot. 16 KB covers tmacopy.py (16 KB chunks).
+// AMD interpreter staging slot size. 16 KB covers tmacopy.py 16 KB chunks
+// AND silu_mul.py's 16 KB-per-token-pair pattern (4096 bf16 elem × 2 tokens
+// = 16 KB). The interpreter declares two of these (slot A + slot B) — see
+// dae2.cuh for the SILU path that uses both.
 static constexpr int daeAmdStagingBytes = 16 * 1024;
 #else
 constexpr bool dae2LoadInstructions = true;

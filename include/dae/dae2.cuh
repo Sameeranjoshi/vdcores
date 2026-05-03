@@ -112,35 +112,101 @@ void dae2(
   // ---- AMD interpreter ----
   const int sm_id = blockIdx.x;
   const int tid = threadIdx.x;
+  const int wave = tid / 64;   // 0,1 = compute; 2 = LD; 3 = ST
+  const int lane = tid % 64;
 
-  // Compute group: threads 0..numComputeWarps*32-1. Walk cinsts to TERMINATEC.
-  if (tid < numComputeWarps * 32) {
+  // ---- Shared state (declared up-front so all 256 threads init together) ----
+  __shared__ DaeAmdSignal load_done;
+  __shared__ DaeAmdSignal store_done;
+  __shared__ DaeAmdSignal compute_done;
+  // Two LDS staging slots A,B (16 KB each = 32 KB total). Single-input tests
+  // (smoke / tmacopy / tma1d) use slot A only; SILU and other dual-input ops
+  // use both.
+  __shared__ alignas(16) uint8_t lds_slot_a[daeAmdStagingBytes];
+  __shared__ alignas(16) uint8_t lds_slot_b[daeAmdStagingBytes];
+  __shared__ bool     is_silu_mode;
+  __shared__ uint16_t silu_num_token;
+  __shared__ unsigned compute_progress;  // counter used by compute wave to fence its writes
+
+  // Init: thread 0 zeroes signals + scans cinsts for compute-op detection.
+  if (tid == 0) {
+    load_done.counter = 0;
+    store_done.counter = 0;
+    compute_done.counter = 0;
+    is_silu_mode = false;
+    silu_num_token = 0;
+    compute_progress = 0;
+
     const CInst* cinsts = compute_instructions + sm_id * numInsts;
     for (uint32_t pc = 0; pc < numInsts; ++pc) {
       uint16_t opc = cinsts[pc].opcode;
       if (opc == OP_TERMINATEC) break;
-      // OP_DUMMY / OP_COPY / others: no-op. The LD/ST waves below move all data.
+      if (opc == OP_SILU_MUL_SHARED_BF16_K_4096_INTER) {
+        is_silu_mode    = true;
+        silu_num_token  = cinsts[pc].args[0];
+        break;
+      }
+    }
+  }
+  __syncthreads();   // all 256 threads see the init state
+
+  // ---- Compute group (threads 0..127, waves 0+1) ----
+  if (tid < numComputeWarps * 32) {
+    if (is_silu_mode) {
+      // Wait for both inputs (gate→A, up→B) to finish loading.
+      while (atomicAdd(&load_done.counter, 0u) < 2u) {
+        __builtin_amdgcn_s_sleep(1);
+      }
+
+      // SILU + Mul: out[i] = silu(gate[i]) * up[i], in-place into slot A.
+      // Element layout matches silu_mul.py: K=4096 bf16 elements per token,
+      // packed as bf16x2 (so K/2 packed pairs per token), N tokens.
+      const int K = 4096;                     // INTERM_DIM in silu_mul.py
+      const int N = silu_num_token;
+      const int total = (K / 2) * N;          // bf162 elements
+      const int n_compute_threads = numComputeWarps * 32;
+
+      __hip_bfloat162* sGate = reinterpret_cast<__hip_bfloat162*>(lds_slot_a);
+      __hip_bfloat162* sUp   = reinterpret_cast<__hip_bfloat162*>(lds_slot_b);
+      __hip_bfloat162* sOut  = reinterpret_cast<__hip_bfloat162*>(lds_slot_a);
+
+      for (int i = tid; i < total; i += n_compute_threads) {
+        __hip_bfloat162 g = sGate[i];
+        __hip_bfloat162 u = sUp[i];
+        float gx = float(g.x), gy = float(g.y);
+        float ux = float(u.x), uy = float(u.y);
+        float ox = (gx / (1.0f + expf(-gx))) * ux;
+        float oy = (gy / (1.0f + expf(-gy))) * uy;
+        __hip_bfloat162 r;
+        r.x = __hip_bfloat16(ox);
+        r.y = __hip_bfloat16(oy);
+        sOut[i] = r;
+      }
+
+      // Inter-wave fence inside the compute group: every compute thread bumps
+      // the progress counter, then spins until all 128 have arrived. This
+      // ensures slot A is fully written before we signal compute_done.
+      __threadfence_block();
+      atomicAdd(&compute_progress, 1u);
+      while (atomicAdd(&compute_progress, 0u) < (unsigned)n_compute_threads) {
+        __builtin_amdgcn_s_sleep(1);
+      }
+
+      if (tid == 0) {
+        __threadfence_block();
+        dae_amd_arrive(compute_done);
+      }
+    } else {
+      // No-op: walk cinsts looking for OP_TERMINATEC. OP_DUMMY/OP_COPY are
+      // ignored — the LD/ST waves below move all data.
+      const CInst* cinsts = compute_instructions + sm_id * numInsts;
+      for (uint32_t pc = 0; pc < numInsts; ++pc) {
+        uint16_t opc = cinsts[pc].opcode;
+        if (opc == OP_TERMINATEC) break;
+      }
     }
     return;
   }
-
-  // Memory group: 64-thread "LD wave" at threads 128-191 and "ST wave" at 192-255.
-  const int wave = tid / 64;     // 2 = LD, 3 = ST
-  const int lane = tid % 64;
-
-  __shared__ DaeAmdSignal load_done;
-  __shared__ DaeAmdSignal store_done;
-  // Single-buffer LDS staging slot for the AMD interpreter. Sized via
-  // daeAmdStagingBytes (16 KB) so it fits the largest workload chunk we
-  // care about (tmacopy.py uses 16 KB loads). Independent of the Python
-  // slot pool — see context.cuh for the full LDS budget breakdown.
-  __shared__ alignas(16) uint8_t lds_slot[daeAmdStagingBytes];
-
-  if (tid == 128) {
-    load_done.counter = 0;
-    store_done.counter = 0;
-  }
-  __syncthreads();
 
   const MInst* minsts = memory_instructions + sm_id * numInsts;
 
@@ -177,26 +243,34 @@ void dae2(
     if (is_alloc_load) {
       load_seq++;
       if (wave == 2 && lane == 0) {
-        // Back-pressure: wait for the prior ST to drain the slot before
-        // reusing it. Only meaningful if at least one store has been issued
-        // (store_seq > 0) — otherwise the LD wave is the only writer and
-        // overwriting the slot is harmless. Without this guard, load-only
-        // programs (e.g. tma1d.py) deadlock on the 2nd load.
-        if (store_seq > 0) {
+        // Pick destination slot. SILU mode dual-loads into A then B. All other
+        // tests use slot A only.
+        uint8_t* slot_ptr = (is_silu_mode && load_seq == 2) ? lds_slot_b : lds_slot_a;
+
+        // Back-pressure (single-slot reuse): wait for the prior ST to drain
+        // the slot before reusing it. SILU never reuses (1 round per kernel)
+        // so we skip the wait there; the LD wave is the only writer and
+        // overwriting is harmless.
+        if (!is_silu_mode && store_seq > 0) {
           dae_amd_wait_at_least(store_done, load_seq - 1);
         }
         const uint64_t addr = inst.address + addr_offset;
         const uint32_t n    = inst.size;
-        dae_amd_copy_g2l(lds_slot, reinterpret_cast<const void*>(addr), n);
+        dae_amd_copy_g2l(slot_ptr, reinterpret_cast<const void*>(addr), n);
         dae_amd_arrive(load_done);
       }
     } else if (is_alloc_store) {
       store_seq++;
       if (wave == 3 && lane == 0) {
-        dae_amd_wait_at_least(load_done, store_seq);
+        // SILU: wait for compute to write slot A. Otherwise: wait for load.
+        if (is_silu_mode) {
+          dae_amd_wait_at_least(compute_done, store_seq);
+        } else {
+          dae_amd_wait_at_least(load_done, store_seq);
+        }
         const uint64_t addr = inst.address + addr_offset;
         const uint32_t n    = inst.size;
-        dae_amd_copy_l2g(reinterpret_cast<void*>(addr), lds_slot, n);
+        dae_amd_copy_l2g(reinterpret_cast<void*>(addr), lds_slot_a, n);
         // device-scope fence so the host (or downstream CTAs) observes the write
         __threadfence();
         dae_amd_arrive(store_done);
