@@ -57,7 +57,8 @@ cases = [
     (1,  4, "K=64  M=16  (4 K-MFMAs accumulating)",              0.10),
     (1, 16, "K=256 M=16  (16 K-MFMAs, matches Gemv_M64N8 K)",    0.50),
     (2, 16, "K=256 M=32  (M-tiling × 2 + K=256)",                0.50),
-    (4,  8, "K=128 M=64  (M-tiling × 4 + K=128, fills slot A)",  0.50),
+    (4,  8, "K=128 M=64  (M-tiling × 4 + K=128, half of atom)",  0.50),
+    (4, 16, "K=256 M=64  (full Gemv_M64N8 atom shape!)",         1.00),
 ]
 
 results = []

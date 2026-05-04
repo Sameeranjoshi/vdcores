@@ -12,22 +12,26 @@ constexpr bool dae2BlockingStore = false;
 #ifdef __HIP_PLATFORM_AMD__
 // AMD CDNA has 64 KB LDS per workgroup vs Hopper's 228 KB. The slot pool
 // alone (24 * 8 KB = 192 KB on the NVIDIA path) doesn't fit. The AMD
-// interpreter uses its own static LDS staging buffer (daeAmdStagingBytes)
-// in addition to the dynamic pool reserved by the Python launcher. Total
-// LDS budget per workgroup must stay under 64 KB:
+// interpreter uses its own static LDS staging slots (slot A + slot B) in
+// addition to the dynamic pool reserved by the Python launcher. Total LDS
+// per workgroup must stay under 64 KB:
 //   dynamic = numSlots * slotSizeKb * 1024  +  4 KB slack (set in launcher.py)
-//   static  = 2 * daeAmdStagingBytes        (slot A + slot B)
-// With numSlots=2, slotSizeKb=8, daeAmdStagingBytes=16K:
-//   16 KB dyn + 4 KB slack + 32 KB static = 52 KB  (fits, ~12 KB margin).
+//   static  = daeAmdStagingBytesA + daeAmdStagingBytesB
+// With numSlots=1, slotSizeKb=8, A=32K, B=16K:
+//   8 KB dyn + 4 KB slack + 32 KB + 16 KB static = 60 KB  (fits, 4 KB margin).
 constexpr bool dae2LoadInstructions = false;
 static constexpr int slotSizeKb = 8;
-static constexpr int numSlots = 2;
+static constexpr int numSlots = 1;
 static constexpr int numInsts = 4096;
-// AMD interpreter staging slot size. 16 KB covers tmacopy.py 16 KB chunks
-// AND silu_mul.py's 16 KB-per-token-pair pattern (4096 bf16 elem × 2 tokens
-// = 16 KB). The interpreter declares two of these (slot A + slot B) — see
-// dae2.cuh for the SILU path that uses both.
-static constexpr int daeAmdStagingBytes = 16 * 1024;
+// Asymmetric staging slots:
+//   Slot A is sized to hold 64 rows × 256 cols of bf16 (= 32 KB) so the
+//   AMD interpreter can run M=64, K=256 GEMV-class kernels (matching the
+//   upstream Gemv_M64N8 atom shape). Smaller workloads (smoke / tmacopy /
+//   silu) only use the first 16 KB.
+//   Slot B is 16 KB — covers silu_mul's 16 KB "up" tensor and any K=256
+//   gemv B (256 × 16 × 2 = 8 KB).
+static constexpr int daeAmdStagingBytesA = 32 * 1024;
+static constexpr int daeAmdStagingBytesB = 16 * 1024;
 #else
 constexpr bool dae2LoadInstructions = true;
 static constexpr int slotSizeKb = 8;

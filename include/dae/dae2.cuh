@@ -122,8 +122,10 @@ void dae2(
   // Two LDS staging slots A,B (16 KB each = 32 KB total). Single-input tests
   // (smoke / tmacopy / tma1d) use slot A only; SILU and other dual-input ops
   // use both.
-  __shared__ alignas(16) uint8_t lds_slot_a[daeAmdStagingBytes];
-  __shared__ alignas(16) uint8_t lds_slot_b[daeAmdStagingBytes];
+  // Asymmetric: slot A is 32 KB (room for 64×256 bf16 GEMV), slot B is 16 KB
+  // (room for silu_mul's "up" tensor or gemv's K×N=256×16 bf16 = 8 KB).
+  __shared__ alignas(16) uint8_t lds_slot_a[daeAmdStagingBytesA];
+  __shared__ alignas(16) uint8_t lds_slot_b[daeAmdStagingBytesB];
   // Compute-mode tag set by the kernel-start scan. The LD/ST waves use this
   // to decide whether to read from slot B (multi-input ops) and whether to
   // wait on compute_done (compute-producing ops) instead of load_done.

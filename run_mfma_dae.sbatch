@@ -33,6 +33,10 @@ echo "==================== sanity: silu_mul ===================="
 timeout 60 python -u app/python/silu_mul.py -l 2>&1 | tail -5 || echo "(silu FAILED)"
 
 echo ""
+echo "==================== sanity: tmacopy (multi-block memory pipeline) ===================="
+timeout 60 python -u app/python/tmacopy.py -l 2>&1 | tail -5 || echo "(tmacopy FAILED)"
+
+echo ""
 echo "==================== MFMA in dae2: K-accumulation ===================="
 timeout 30 python -u mfma_dae_test.py 2>&1 | tail -20 || echo "(mfma-dae FAILED)"
 
