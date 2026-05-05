@@ -119,6 +119,10 @@ void dae2(
   __shared__ DaeAmdSignal load_done;
   __shared__ DaeAmdSignal store_done;
   __shared__ DaeAmdSignal compute_done;
+  // Compute wave bumps this each time it finishes consuming a chunk pair
+  // (slot A + slot B). LD wave waits on it before reusing slots for the
+  // next chunk. Used by chunked MFMA (cross-atom-call K-accumulation).
+  __shared__ DaeAmdSignal compute_consumed;
   // Two LDS staging slots A,B (16 KB each = 32 KB total). Single-input tests
   // (smoke / tmacopy / tma1d) use slot A only; SILU and other dual-input ops
   // use both.
@@ -134,6 +138,7 @@ void dae2(
   __shared__ uint16_t silu_num_token;
   __shared__ uint16_t mfma_k_iters;        // # of 16-wide K chunks (accumulated)
   __shared__ uint16_t mfma_m_blocks;       // # of 16-wide M chunks (M_total = m_blocks * 16)
+  __shared__ uint16_t mfma_num_chunks;     // # of K-chunks streamed across atom calls (K_total = num_chunks * K_iters * 16)
   __shared__ unsigned compute_progress;    // counter used by compute wave to fence its writes
 
   // AMD MFMA bf16 16x16xK matmul (K = mfma_k_iters * 16). Hijacks OP_GEMM_M64N64
@@ -156,10 +161,12 @@ void dae2(
     load_done.counter = 0;
     store_done.counter = 0;
     compute_done.counter = 0;
+    compute_consumed.counter = 0;
     compute_mode = CMODE_NONE;
     silu_num_token = 0;
     mfma_k_iters = 1;     // default = 1 iteration (K=16)
     mfma_m_blocks = 1;    // default = 1 row-block (M=16)
+    mfma_num_chunks = 1;  // default = 1 chunk (single atom call, no cross-atom accumulation)
     compute_progress = 0;
 
     const CInst* cinsts = compute_instructions + sm_id * numInsts;
@@ -173,11 +180,14 @@ void dae2(
       }
       if (opc == OP_AMD_DEBUG_MATMUL_BF16) {
         compute_mode = CMODE_MFMA;
-        // args[0] = K_iters, args[1] = M_blocks. Default to 1 each if zero.
-        uint16_t k_iters  = cinsts[pc].args[0];
-        uint16_t m_blocks = cinsts[pc].args[1];
-        mfma_k_iters  = (k_iters  > 0) ? k_iters  : 1;
-        mfma_m_blocks = (m_blocks > 0) ? m_blocks : 1;
+        // args[0] = K_iters, args[1] = M_blocks, args[2] = num_chunks.
+        // Default each to 1 if zero (matches single-atom behavior).
+        uint16_t k_iters    = cinsts[pc].args[0];
+        uint16_t m_blocks   = cinsts[pc].args[1];
+        uint16_t num_chunks = cinsts[pc].args[2];
+        mfma_k_iters    = (k_iters    > 0) ? k_iters    : 1;
+        mfma_m_blocks   = (m_blocks   > 0) ? m_blocks   : 1;
+        mfma_num_chunks = (num_chunks > 0) ? num_chunks : 1;
         break;
       }
     }
@@ -235,30 +245,28 @@ void dae2(
         dae_amd_arrive(compute_done);
       }
     } else if (is_mfma_mode) {
-      // bf16 (M_total x N=16) = (M_total x K_total) @ (K_total x 16) matmul,
-      // where M_total = mfma_m_blocks * 16 and K_total = mfma_k_iters * 16.
-      // Inputs: slot A = A[M_total, K_total] bf16 row-major, slot B = B[K_total, 16]
-      //         bf16 row-major.
-      // Output: D = A @ B as bf16, written into slot A in-place (the first
-      //         M_total * 16 * 2 bytes; this never overlaps the unread tail
-      //         of A as long as the full output fits below row 16 of A).
+      // bf16 (M_total x N=16) = (M_total x K_global) @ (K_global x 16) matmul,
+      // where M_total  = mfma_m_blocks * 16
+      //   and K_chunk  = mfma_k_iters  * 16   (K per atom call, fits in slot A)
+      //   and K_global = K_chunk * mfma_num_chunks  (cross-atom-call total).
       //
-      // K-accumulation: per row-block we chain K_iters MFMA calls, feeding
-      // the fp32 accumulator forward.
-      // M-tiling: outer loop over m_outer (0..M_blocks-1), each independent.
+      // Slot A holds the current chunk's A[M_total, K_chunk] bf16 row-major,
+      // slot B holds the current chunk's B[K_chunk, 16] bf16 row-major.
+      // Per-lane fp32 accumulators persist across chunks (wave 0, 64 lanes,
+      // M_blocks accumulators each — registers, no LDS).
+      //
+      // Producer/consumer with the LD wave: for each chunk c, wait for
+      // load_done >= 2*(c+1) (A+B both loaded), MFMA-accumulate, then
+      // signal compute_consumed so LD can stream chunk c+1 over the same
+      // LDS slots. After all chunks, write final D into slot A.
 
-      // Wait for both inputs.
-      while (atomicAdd(&load_done.counter, 0u) < 2u) {
-        __builtin_amdgcn_s_sleep(1);
-      }
-
-      // Only wave 0 (lanes 0..63) participates in the MFMAs. Wave 1 sits idle.
       typedef int16_t bf16x4 __attribute__((ext_vector_type(4)));
       typedef float   f32x4  __attribute__((ext_vector_type(4)));
 
-      const int K_iters  = (int)mfma_k_iters;
-      const int M_blocks = (int)mfma_m_blocks;
-      const int K_total  = K_iters * 16;
+      const int K_iters    = (int)mfma_k_iters;
+      const int M_blocks   = (int)mfma_m_blocks;
+      const int num_chunks = (int)mfma_num_chunks;
+      const int K_chunk    = K_iters * 16;
 
       if (tid < 64) {
         const int lane     = tid;
@@ -270,29 +278,53 @@ void dae2(
         const __hip_bfloat16* sB = reinterpret_cast<const __hip_bfloat16*>(lds_slot_b);
         __hip_bfloat16* sOut = reinterpret_cast<__hip_bfloat16*>(lds_slot_a);
 
-        for (int m_outer = 0; m_outer < M_blocks; ++m_outer) {
-          const int m_base = m_outer * 16;
-          f32x4 acc = {0.0f, 0.0f, 0.0f, 0.0f};
+        // Per-lane accumulators, one per row-block. Live across chunks.
+        // Bound at 4 (matches max M_blocks we exercise: M=64).
+        constexpr int M_BLOCKS_MAX = 4;
+        f32x4 accs[M_BLOCKS_MAX];
+        for (int m = 0; m < M_BLOCKS_MAX; ++m) accs[m] = f32x4{0.0f, 0.0f, 0.0f, 0.0f};
 
-          for (int k_iter = 0; k_iter < K_iters; ++k_iter) {
-            const int k_base = k_iter * 16;
-            bf16x4 a, b;
-            for (int i = 0; i < 4; ++i) {
-              __hip_bfloat16 av = sA[(m_base + row_in16) * K_total + (k_base + kblk_id * 4 + i)];
-              __hip_bfloat16 bv = sB[(k_base + kblk_id * 4 + i) * 16 + col];
-              int16_t ai, bi;
-              __builtin_memcpy(&ai, &av, sizeof(ai));
-              __builtin_memcpy(&bi, &bv, sizeof(bi));
-              a[i] = ai;
-              b[i] = bi;
-            }
-            acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, acc, 0, 0, 0);
+        for (int chunk = 0; chunk < num_chunks; ++chunk) {
+          // Wait for this chunk's A and B to be staged in slot A,B.
+          while (atomicAdd(&load_done.counter, 0u) < (unsigned)(2 * (chunk + 1))) {
+            __builtin_amdgcn_s_sleep(1);
           }
 
-          // Cast lane's 4 fp32 outputs back to bf16 in row-major.
-          // lane k holds D[m_base + (k/16)*4 + 0..3, k%16] within slot A.
-          const int row_q = lane / 16;   // 0..3 (which row-quartile of MFMA output)
-          const int n     = lane % 16;
+          // K-accumulate this chunk into accs[m] for each M row-block.
+          for (int m_outer = 0; m_outer < M_blocks; ++m_outer) {
+            const int m_base = m_outer * 16;
+            f32x4 acc = accs[m_outer];
+            for (int k_iter = 0; k_iter < K_iters; ++k_iter) {
+              const int k_base = k_iter * 16;
+              bf16x4 a, b;
+              for (int i = 0; i < 4; ++i) {
+                __hip_bfloat16 av = sA[(m_base + row_in16) * K_chunk + (k_base + kblk_id * 4 + i)];
+                __hip_bfloat16 bv = sB[(k_base + kblk_id * 4 + i) * 16 + col];
+                int16_t ai, bi;
+                __builtin_memcpy(&ai, &av, sizeof(ai));
+                __builtin_memcpy(&bi, &bv, sizeof(bi));
+                a[i] = ai;
+                b[i] = bi;
+              }
+              acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, acc, 0, 0, 0);
+            }
+            accs[m_outer] = acc;
+          }
+
+          // Lane 0 of wave 0 signals slot reuse OK. Wave-0 lanes run in
+          // lockstep, so all 64 have finished MFMA by this point.
+          if (lane == 0) {
+            dae_amd_arrive(compute_consumed);
+          }
+        }
+
+        // After all chunks: cast accumulators to bf16 in slot A in-place.
+        // lane k holds D[m_base + (k/16)*4 + 0..3, k%16].
+        const int row_q = lane / 16;   // 0..3 (which row-quartile of MFMA output)
+        const int n     = lane % 16;
+        for (int m_outer = 0; m_outer < M_blocks; ++m_outer) {
+          const int m_base = m_outer * 16;
+          f32x4 acc = accs[m_outer];
           sOut[(m_base + row_q * 4 + 0) * 16 + n] = __hip_bfloat16(acc[0]);
           sOut[(m_base + row_q * 4 + 1) * 16 + n] = __hip_bfloat16(acc[1]);
           sOut[(m_base + row_q * 4 + 2) * 16 + n] = __hip_bfloat16(acc[2]);
@@ -360,15 +392,28 @@ void dae2(
     if (is_alloc_load) {
       load_seq++;
       if (wave == 2 && lane == 0) {
-        // Pick destination slot. Compute ops with two inputs dual-load into
-        // A then B; single-input tests use slot A only.
-        uint8_t* slot_ptr = (needs_two_inputs && load_seq == 2) ? lds_slot_b : lds_slot_a;
+        // Pick destination slot. Compute ops alternate A,B,A,B,... per chunk
+        // pair: odd load_seq -> slot A (an "A" load), even -> slot B.
+        // Pure-memory tests use slot A only.
+        uint8_t* slot_ptr;
+        if (needs_two_inputs) {
+          slot_ptr = (load_seq % 2 == 1) ? lds_slot_a : lds_slot_b;
+        } else {
+          slot_ptr = lds_slot_a;
+        }
 
-        // Back-pressure (single-slot reuse): wait for the prior ST to drain
-        // the slot before reusing it. Compute-mode kernels run one round per
-        // kernel launch and don't reuse slots — skip the wait there.
+        // Back-pressure:
+        // (a) Pure-memory tests: wait for the prior store to drain slot A.
+        // (b) Chunked compute: before loading chunk c+1's A (load_seq odd
+        //     and >=3, i.e. not the first chunk), wait for compute to have
+        //     consumed chunk c. Same logic for B (even load_seq >= 4).
         if (!produces_compute && store_seq > 0) {
           dae_amd_wait_at_least(store_done, load_seq - 1);
+        } else if (produces_compute && load_seq > 2) {
+          // chunk being loaded = (load_seq - 1) / 2 (0-indexed). We need
+          // chunk-1 consumed before overwriting its slot.
+          unsigned chunk_being_loaded = (load_seq - 1) / 2;
+          dae_amd_wait_at_least(compute_consumed, chunk_being_loaded);
         }
         const uint64_t addr = inst.address + addr_offset;
         const uint32_t n    = inst.size;

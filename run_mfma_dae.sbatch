@@ -44,5 +44,9 @@ echo ""
 echo "==================== MFMA in dae2: multi-block GEMV ===================="
 timeout 60 python -u mfma_gemv_test.py 2>&1 | tail -20 || echo "(mfma-gemv FAILED)"
 
+echo ""
+echo "==================== MFMA in dae2: chunked GEMV (K up to 4096) ===================="
+timeout 120 python -u mfma_gemv4k_test.py 2>&1 | tail -20 || echo "(mfma-gemv4k FAILED)"
+
 echo "=== job ${SLURM_JOB_ID} done ==="
 date
