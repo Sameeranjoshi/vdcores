@@ -294,7 +294,13 @@ __device__ __forceinline__ unsigned get_sreg_clusterid_x() {
   return blockIdx.x;
 }
 __device__ __forceinline__ unsigned long long get_sreg_globaltimer() {
-  return __builtin_readcyclecounter();
+  // Wave-comparable wall-clock counter on CDNA. __builtin_readcyclecounter
+  // (s_memtime) is per-shader-engine and yields garbage when start and end
+  // are written from different waves — use s_memrealtime (the steady counter
+  // backing wall_clock64) so end-start is a valid positive delta.
+  // Unit is gfx942 wall-clock ticks (typically 100 MHz → 10 ns/tick); the
+  // host queries hipDeviceAttributeWallClockRate to convert to ns.
+  return __builtin_amdgcn_s_memrealtime();
 }
 
 // Memory-space tags (NVIDIA TMA API). On AMD we just need names.

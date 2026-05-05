@@ -142,6 +142,15 @@ void dae2(
   // compute_opcode_order.inc.
   constexpr uint16_t OP_AMD_DEBUG_MATMUL_BF16 = OP_GEMM_M64N64;
 
+  // Start-of-kernel timestamp for dae.bench(). Pairs with the end timestamp
+  // written at the bottom of this branch by wave 3 lane 0. The NVIDIA path
+  // writes this at line ~492 — the AMD branch returns before that, so we
+  // need to emit it here.
+  if (tid == 0) {
+    int event_base = sm_id * numProfileEvents;
+    g_events[event_base + 0] = cuda::ptx::get_sreg_globaltimer();
+  }
+
   // Init: thread 0 zeroes signals + scans cinsts for compute-op detection.
   if (tid == 0) {
     load_done.counter = 0;
@@ -410,6 +419,15 @@ void dae2(
         addr_offset += repeat_offset;
       }
     }
+  }
+
+  // End-of-kernel timestamp for dae.bench(). The ST wave is the last to
+  // finish (its final store waits on compute_done / load_done), so wave 3
+  // lane 0 captures the SM's true end time. Pairs with the start timestamp
+  // written at line 492.
+  if (wave == 3 && lane == 0) {
+    int event_base = sm_id * numProfileEvents;
+    g_events[event_base + 1] = cuda::ptx::get_sreg_globaltimer();
   }
   return;
 #else
