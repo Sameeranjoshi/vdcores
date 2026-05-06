@@ -1,4 +1,4 @@
-import sys; sys.argv = ['x', '-l']                                                                          
+import sys; sys.argv = ['x', '-b', '10']                                                                          
 import torch
 from dae.launcher import *                                                                                  
 from dae.util import dae_app
@@ -17,7 +17,8 @@ def f(sm):
         [TmaStore1D(out[sm,0]), load_bytes])                                                                
 dae.i(Copy(num_loads, load_bytes), f, TerminateM(), TerminateC())                                           
                                                                                                             
-dae_app(dae)                                                                                                
+total_bytes = num_sms * num_loads * load_bytes * 2  # read + write
+dae_app(dae, total_bytes=total_bytes)                                                                                                
 torch.cuda.synchronize()                                                                                    
 print("equal:", torch.equal(vec, out), flush=True)                            
 print("vec[:8]:", vec.flatten()[:8].tolist())                                                               

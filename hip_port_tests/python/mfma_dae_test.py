@@ -17,6 +17,8 @@ from dae.launcher import (
 from dae.runtime import opcode as op_module
 
 OP_AMD_DEBUG_MATMUL_BF16 = int(op_module.OP_GEMM_M64N64)
+NS_PER_TICK = 10.0  # MI300X wall_clock64 = 100 MHz → 10 ns/tick
+BENCH_ITERS = 10
 gpu = torch.device('cuda')
 
 
@@ -45,7 +47,15 @@ def run_one(M_blocks: int, K_iters: int, seed: int = 0):
 
     ref = (A.to(torch.float32) @ B.to(torch.float32)).to(torch.bfloat16)
     diff = (C.to(torch.float32) - ref.to(torch.float32)).abs()
-    return diff.max().item(), diff.mean().item(), C, ref
+
+    times_ns = []
+    for _ in range(BENCH_ITERS):
+        dae.launch()
+        prof = dae.profile[0, 0:2].cpu().numpy()
+        times_ns.append((int(prof[1]) - int(prof[0])) * NS_PER_TICK)
+    min_us = min(times_ns) / 1e3
+
+    return diff.max().item(), diff.mean().item(), C, ref, min_us
 
 
 print("MFMA in dae2 — K-accumulation + M-tiling tests")
@@ -63,10 +73,10 @@ cases = [
 
 results = []
 for M_blocks, K_iters, label, tol in cases:
-    max_e, mean_e, C, ref = run_one(M_blocks, K_iters, seed=K_iters * 100 + M_blocks)
+    max_e, mean_e, C, ref, min_us = run_one(M_blocks, K_iters, seed=K_iters * 100 + M_blocks)
     ok = max_e < tol
     status = "PASS" if ok else "FAIL"
-    print(f"  {label:55s}  max={max_e:.6f}  mean={mean_e:.6f}  {status}")
+    print(f"  {label:55s}  max={max_e:.6f}  mean={mean_e:.6f}  min={min_us:7.2f}us  {status}")
     if not ok:
         print(f"    C  [0,:4] = {C[0, :4].tolist()}")
         print(f"    ref[0,:4] = {ref[0, :4].tolist()}")

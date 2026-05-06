@@ -3,9 +3,9 @@
 #SBATCH --partition=mi3001x
 #SBATCH --nodes=1
 #SBATCH --ntasks=4
-#SBATCH --time=00:08:00
-#SBATCH --output=hip_port_tests/logs/vdcores-%j.out
-#SBATCH --error=hip_port_tests/logs/vdcores-%j.err
+#SBATCH --time=00:12:00
+#SBATCH --output=/work1/maryhall/sameeran/work/vdcores/hip_port_tests/logs/vdcores-%j.out
+#SBATCH --error=/work1/maryhall/sameeran/work/vdcores/hip_port_tests/logs/vdcores-%j.err
 
 # Single consolidated sbatch for the AMD (hip-port) megakernel tests.
 # Builds runtime.o for gfx942, reinstalls the dae python package, then runs
@@ -50,13 +50,21 @@ run_test() {
 run_test "sanity: smoke (single SM, 1D copy)" 30 \
   python -u hip_port_tests/python/dae_copy_smoke.py
 
+# Sanity: 1D load-only pipeline (Dummy compute, no store).
+run_test "sanity: tma1d (1D load pipeline)" 30 \
+  python -u app/python/tma1d.py -b 10
+
+# Sanity: 1D load+store pipeline (Dummy compute).
+run_test "sanity: dae3 (1D load+store pipeline)" 30 \
+  python -u app/python/dae3.py -b 10
+
 # Sanity: multi-block memory pipeline (132 SMs, slot reuse, back-pressure).
 run_test "sanity: tmacopy (multi-block memory pipeline)" 60 \
-  python -u app/python/tmacopy.py -l
+  python -u app/python/tmacopy.py -b 10
 
 # Real compute #1: SILU+Mul fused activation (compute wave produces output).
 run_test "compute: silu_mul (compute_done signaling)" 60 \
-  python -u app/python/silu_mul.py -l
+  python -u app/python/silu_mul.py -b 10
 
 # Real compute #2: MFMA bf16 16x16 with K-accumulation + M-tiling.
 run_test "compute: mfma-dae K+M tiling" 30 \
