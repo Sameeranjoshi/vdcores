@@ -85,6 +85,8 @@ inst*.dump
 # SLURM job logs
 vdcores-*.out
 vdcores-*.err
+hip_port_tests/logs/*
+!hip_port_tests/logs/.gitkeep
 
 # app/hip built binaries (sources end in .cpp; binaries have no extension)
 app/hip/vdcores_hip_demo
