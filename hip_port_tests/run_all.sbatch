@@ -80,6 +80,12 @@ run_test "compute: multi-block GEMV (K=256)" 60 \
 run_test "compute: chunked GEMV (K up to 4096)" 120 \
   python -u hip_port_tests/python/mfma_gemv4k_test.py
 
+# Real compute #5: GEMV_WGMMA family opcode validation via Gemv_M64N8.
+# Tests AMD interpreter recognition of OP_GEMV_WGMMA__M_64__N_8__K_256__BLOAD_4
+# and handler extraction of kTiles → mfma_num_chunks parameter mapping.
+run_test "compute: GEMV_WGMMA (Gemv_M64N8 family opcode)" 120 \
+  python -u hip_port_tests/python/mfma_gemv_wgmma_test.py
+
 echo ""
 echo "=== job ${SLURM_JOB_ID} done ==="
 date

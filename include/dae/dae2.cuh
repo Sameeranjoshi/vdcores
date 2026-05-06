@@ -190,6 +190,22 @@ void dae2(
         mfma_num_chunks = (num_chunks > 0) ? num_chunks : 1;
         break;
       }
+      // Handle GEMV_WGMMA family opcodes (0x701a-0x701e).
+      // Maps K and BLOAD constraints to MFMA iteration counts.
+      // All variants: M=64 → M_blocks=4, num_chunks=args[0] (kTiles).
+      if (opc >= 0x701a && opc <= 0x701e) {
+        compute_mode = CMODE_MFMA;
+        uint16_t k_iters = 16;  // default K=256
+        if (opc == 0x701c) {
+          k_iters = 4;  // K=64
+        } else if (opc == 0x701d) {
+          k_iters = 8;  // K=128
+        }
+        mfma_k_iters    = k_iters;
+        mfma_m_blocks   = 4;                    // M=64 → 4 blocks of 16 rows
+        mfma_num_chunks = cinsts[pc].args[0];  // kTiles from Gemv_M64N8(kTiles=...)
+        break;
+      }
     }
   }
   __syncthreads();   // all 256 threads see the init state
