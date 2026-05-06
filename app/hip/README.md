@@ -1,4 +1,9 @@
-# VDCores HIP demo
+# VDCores HIP demo — historical scaffolding
+
+> **Note:** These files are the early scaffolding used to port VDCores to AMD MI300X.
+> They are preserved for reference and to document the progression, but they are **not
+> part of the active test suite**. The canonical AMD tests live in
+> `hip_port_tests/python/` and are run via `hip_port_tests/run_all.sbatch`.
 
 Minimal proof-of-concept showing the VDCores decoupled memory/compute model on AMD HIP.
 One CTA = one **memory wavefront** + one **compute wavefront**, communicating through LDS.
@@ -6,7 +11,19 @@ One CTA = one **memory wavefront** + one **compute wavefront**, communicating th
 Workload: `c = a + b` over chunks staged into LDS.
 
 ## Files
-- `vdcores_hip_demo.cpp` — kernel + host driver (HIP)
+
+**Staircase (L0 → L3)** — each rung adds one architectural feature over the previous:
+- `vdcores_hip_demo.cpp` — L0: 2-wave `c = a+b`, `__syncthreads` barrier
+- `vdcores_hip_l1.cpp` — L1: explicit `s_waitcnt` async load discipline
+- `vdcores_hip_l2.cpp` — L2: LDS-counter signals replace `__syncthreads`
+- `vdcores_hip_l3.cpp` — L3: split mem wave → LD wave + ST wave (3-wave DAE)
+
+**MFMA validation** — stepping stones used to verify the bf16 MFMA lane layout before
+integrating into the dae2 interpreter (superseded by `mfma_dae_test.py`):
+- `mfma_smoke.cpp` — all-ones 16×16 bf16 MFMA, expects 16.0 output
+- `mfma_matmul.cpp` — non-trivial matmul (A × identity = A) to confirm lane mapping
+
+**Build infrastructure:**
 - `Makefile` — builds with `hipcc`, auto-detecting `--offload-arch` via `rocminfo`
   (falls back to `gfx942` / MI300X). Override with `make ARCH=gfx90a` for MI210.
 
