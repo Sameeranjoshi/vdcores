@@ -1,19 +1,43 @@
 #pragma once
 
 #include <cstdint>
-#include <cuda_runtime.h>
-#include <cuda/barrier>
-#include <cuda/ptx>
+#include <hip/hip_runtime.h>
+#include "dae/hip_compat.cuh"
 
 // features
 constexpr bool dae2EnableLooping = true;
 constexpr bool dae2EnableGroup = true;
 constexpr bool dae2BlockingStore = false;
-constexpr bool dae2LoadInstructions = true;
 
+#ifdef __HIP_PLATFORM_AMD__
+// AMD CDNA has 64 KB LDS per workgroup vs Hopper's 228 KB. The slot pool
+// alone (24 * 8 KB = 192 KB on the NVIDIA path) doesn't fit. The AMD
+// interpreter uses its own static LDS staging slots (slot A + slot B) in
+// addition to the dynamic pool reserved by the Python launcher. Total LDS
+// per workgroup must stay under 64 KB:
+//   dynamic = numSlots * slotSizeKb * 1024  +  4 KB slack (set in launcher.py)
+//   static  = daeAmdStagingBytesA + daeAmdStagingBytesB
+// With numSlots=1, slotSizeKb=8, A=32K, B=16K:
+//   8 KB dyn + 4 KB slack + 32 KB + 16 KB static = 60 KB  (fits, 4 KB margin).
+constexpr bool dae2LoadInstructions = false;
+static constexpr int slotSizeKb = 8;
+static constexpr int numSlots = 1;
+static constexpr int numInsts = 4096;
+// Asymmetric staging slots:
+//   Slot A is sized to hold 64 rows × 256 cols of bf16 (= 32 KB) so the
+//   AMD interpreter can run M=64, K=256 GEMV-class kernels (matching the
+//   upstream Gemv_M64N8 atom shape). Smaller workloads (smoke / tmacopy /
+//   silu) only use the first 16 KB.
+//   Slot B is 16 KB — covers silu_mul's 16 KB "up" tensor and any K=256
+//   gemv B (256 × 16 × 2 = 8 KB).
+static constexpr int daeAmdStagingBytesA = 32 * 1024;
+static constexpr int daeAmdStagingBytesB = 16 * 1024;
+#else
+constexpr bool dae2LoadInstructions = true;
 static constexpr int slotSizeKb = 8;
 static constexpr int numSlots = 24;
 static constexpr int numInsts = dae2LoadInstructions ? 512 : 4096;
+#endif
 static constexpr int numTmas = 1024;
 static constexpr int numBars = 1024;
 

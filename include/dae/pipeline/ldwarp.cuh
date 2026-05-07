@@ -2,6 +2,110 @@
 
 #include "virtualcore.cuh"
 
+#ifdef __HIP_PLATFORM_AMD__
+// AMD: real LD pipeline for the 1-D global -> LDS path used by tmacopy.py.
+// Hopper TMA is replaced by a synchronous wide-load loop; the producer arrive()
+// is followed by a __threadfence_block() so the LDS contents are visible to
+// the compute warps the m2c barrier wakes up. Multi-D / TMA-tensor ops are
+// still trapped — they need a tensor-descriptor codegen pass that doesn't
+// exist on AMD yet.
+template<typename M2LD_Type, typename M2C_Type>
+__device__ __forceinline__ void ldwarp_execute_singlethread(
+    M2LD_Type &m2ld, M2C_Type &m2c,
+    const MInst *st_insts,
+    const void *smem_base, const CUtensorMap *tma_descs, int *bars) {
+
+  __ldprint("[LD Warp][AMD] Start LD warp execution");
+
+  int regFile[4];
+  m2ld.wait();
+  LdCmd cmd { .raw = m2ld.data[m2ld.ptr] };
+
+  while (cmd.slot != SLOT_END) {
+    auto &slot = cmd.slot;
+    auto inst = st_insts[slot];
+
+    m2ld.advance();
+
+    auto &opcode = cmd.opcode;
+    auto &bar = cmd.bar;
+
+    __ldprint("Receive LD cmd: slot=%d bar=%d opcode=%d", slot, bar, op(opcode));
+
+    if ((opcode & MEM_OP_FLAGS_BARRIER) && !(opcode & MEM_OP_FLAGS_WRITEBACK)) {
+      volatile int *bar_ptr = bars + inst.bar();
+      while (*bar_ptr != 0) {
+        __builtin_amdgcn_s_sleep(1);
+      }
+      __ldprint("wait for global barrier before load: bar=%d", inst.bar());
+    }
+
+    switch(op(opcode)) {
+      case op(OP_ALLOC_TMA_LOAD_1D): {
+        __ldprint("[AMD] 1D Load: size=%d", inst.size);
+        // Single-thread synchronous global->LDS copy. Uses 16-byte loads
+        // where alignment allows; falls back to bytes for the tail.
+        // inst.address is a flat global pointer; slot pointer is in LDS.
+        const char* __restrict__ src =
+            reinterpret_cast<const char*>(inst.address);
+        char* __restrict__ dst =
+            reinterpret_cast<char*>(get_slot_address(smem_base, slot));
+        const size_t n = inst.size;
+        const uintptr_t srcaddr = reinterpret_cast<uintptr_t>(src);
+        const uintptr_t dstaddr = reinterpret_cast<uintptr_t>(dst);
+        if (((srcaddr | dstaddr) & 0xF) == 0 && (n & 0xF) == 0) {
+          const uint4* __restrict__ s4 = reinterpret_cast<const uint4*>(src);
+          uint4* __restrict__ d4 = reinterpret_cast<uint4*>(dst);
+          const size_t n16 = n >> 4;
+          #pragma unroll 1
+          for (size_t i = 0; i < n16; ++i) d4[i] = s4[i];
+        } else {
+          #pragma unroll 1
+          for (size_t i = 0; i < n; ++i) dst[i] = src[i];
+        }
+        break;
+      }
+      case op(OP_ALLOC_WB_REG_STORE): {
+        int slotMask = mkSlotMask(slot, inst.nslot());
+        m2c.data[bar] = slotMask | 0x80000000U;
+        regFile[inst.size] = slotMask;
+        __ldprint("[REG] store: reg_id=%d slot=%d nslot=%d bar=%d slotMask=0x%X",
+          inst.size, slot, inst.nslot(), bar, slotMask);
+        break;
+      }
+      case op(OP_ALLOC_REG_LOAD): {
+        m2c.data[bar] = regFile[inst.size];
+        __ldprint("[REG] load: reg_id=%d bar=%d slotMask=0x%X",
+          inst.size, bar, regFile[inst.size]);
+        break;
+      }
+      case op(OP_ALLOC_WB_TMA_STORE_1D):
+      case op(OP_ALLOC_WB_RAW_ADDRESS): {
+        // Writeback ops: nothing for the LD warp to load. The store warp
+        // performs the actual global write later. We still need to fall
+        // through to the m2c arrive() below so the compute warp learns
+        // the slot has been allocated.
+        __ldprint("[AMD] WB op (no LD work): slot=%d op=%d", slot, op(opcode));
+        break;
+      }
+      default:
+        // Tensor-descriptor / multi-D TMA ops: not implemented on AMD yet.
+        // Trap so we never silently drop a load.
+        __builtin_trap();
+    }
+
+    // Make LDS writes visible to the compute warps the barrier wakes up.
+    __threadfence_block();
+    (void)m2c.barriers[bar].arrive();
+
+    m2ld.wait();
+    cmd.raw = m2ld.data[m2ld.ptr];
+  }
+
+  __ldprint("[AMD] End of LD warp execution");
+}
+#else
+
 template<typename M2LD_Type, typename M2C_Type>
 __device__ __forceinline__ void ldwarp_execute_singlethread(
     M2LD_Type &m2ld, M2C_Type &m2c,
@@ -192,3 +296,5 @@ __device__ __forceinline__ void ldwarp_execute_singlethread(
   __ldprint("End of LD warp execution");
   // __print(0, "End of LD warp execution");
 }
+
+#endif  // __HIP_PLATFORM_AMD__

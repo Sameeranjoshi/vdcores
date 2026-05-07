@@ -1,21 +1,22 @@
 #include "dae2.cuh"
 #include "runtime.cuh"
 
-#include <cuda.h>
+#include <hip/hip_runtime.h>
+#include <iostream>
+#include <array>
 
 size_t set_smem_size(size_t smem_size) {
-    cudaError_t err = cudaFuncSetAttribute(
-        dae2,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
+    hipError_t err = hipFuncSetAttribute(reinterpret_cast<const void*>(dae2),
+        hipFuncAttributeMaxDynamicSharedMemorySize,
         smem_size
     );
-    if (err != cudaSuccess) {
-        std::cerr << "Kernel set parameter failed: " << cudaGetErrorString(err) << std::endl;
+    if (err != hipSuccess) {
+        std::cerr << "Kernel set parameter failed: " << hipGetErrorString(err) << std::endl;
     }
     return smem_size;
 }
 
-cudaError_t launch_dae(
+hipError_t launch_dae(
   int numSMs,
   size_t smem_size,
   CInst* compute_instructions,
@@ -26,8 +27,8 @@ cudaError_t launch_dae(
   int64_t stream
 ) {
   // wait for all pre-launch meta-data copying
-  cudaDeviceSynchronize();
-  cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+  hipDeviceSynchronize();
+  hipStream_t cuda_stream = reinterpret_cast<hipStream_t>(stream);
   dae2<<<numSMs, numThreads, smem_size, cuda_stream>>>(
     compute_instructions,
     memory_instructions,
@@ -37,11 +38,27 @@ cudaError_t launch_dae(
   );
   // TODO(zhiyuang): check launch error here?
 
-  cudaDeviceSynchronize();
+  hipDeviceSynchronize();
 
-  return cudaGetLastError();
+  return hipGetLastError();
 }
 
+#ifdef __HIP_PLATFORM_AMD__
+// AMD STUB: TMA descriptors don't exist on CDNA3.
+CUtensorMap create_tma_descriptor(
+  CUtensorMapDataType,
+  int,
+  void *,
+  std::array<uint64_t, 5>,
+  std::array<uint32_t, 5>,
+  CUtensorMapSwizzle,
+  std::array<uint64_t, 5>
+) {
+  CUtensorMap desc{};
+  std::cerr << "[VDCores][HIP] create_tma_descriptor called: TMA not supported on AMD\n";
+  return desc;
+}
+#else
 CUtensorMap create_tma_descriptor(
   CUtensorMapDataType data_type,
   int dims,
@@ -101,7 +118,8 @@ CUtensorMap create_tma_descriptor(
     CU_TENSOR_MAP_L2_PROMOTION_L2_128B,  // No L2 promotion
     CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE // No special OOB handling
   );
-  assert(result == CUDA_SUCCESS && "Failed to create tensor map");
-  
+  assert(result == hipSuccess && "Failed to create tensor map");
+
   return desc;
 }
+#endif  // __HIP_PLATFORM_AMD__

@@ -3,11 +3,19 @@
 #include "virtualcore.cuh"
 #include "rope.cuh"
 
+#ifdef __HIP_PLATFORM_AMD__
+// AMD STUB: gemv WGMMA path. Replace with MFMA-based GEMV on CDNA3.
+template <int M, int N, int K, typename... Args>
+__device__ __forceinline__ void task_gemv_mma(Args&&...) { __builtin_trap(); }
+template <typename Atom, int M, int K, int b_load_interval, bool residual,
+          typename... Args>
+__device__ __forceinline__ void task_gemv(Args&&...) { __builtin_trap(); }
+#else
 #include <cute/tensor.hpp>
-#include <cute/arch/mma_sm80.hpp>      // SM80_16x8x16_F16F16F16F16_TN
-#include <cute/arch/mma_sm90.hpp>      // SM80_16x8x16_F16F16F16F16_TN
-#include <cute/atom/mma_atom.hpp>      // MMA_Atom / make_tiled_mma
-#include <cute/algorithm/gemm.hpp>     // cute::gemm
+#include <cute/arch/mma_sm80.hpp>
+#include <cute/arch/mma_sm90.hpp>
+#include <cute/atom/mma_atom.hpp>
+#include <cute/algorithm/gemm.hpp>
 
 // TODO(zhiyuang): this is a gemv style wgmma, not tile overN but prefetch K tiles
 template<typename Atom, int M, int K,
@@ -202,3 +210,5 @@ __device__ __forceinline__ void task_gemv_mma(const int nTiles, void *base, M2C_
     copy(frag_C, thr_mma.partition_C(t_sC));
     c2m.template push<0, true>(tid, slot_c);
 }
+
+#endif  // __HIP_PLATFORM_AMD__

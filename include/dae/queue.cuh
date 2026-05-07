@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 #pragma once
 
 #include "context.cuh"
@@ -78,6 +79,13 @@ struct SizeBoundedBarrierAllocQueue : public SizeBoundedBarrierQueue<int, QSIZE>
   ) : Base{bars, datalist, ptr}, shared_avail(__cvta_generic_to_shared(flaglist)) {}
 
   __device__ __forceinline__ void reset(int msg) {
+#ifdef __HIP_PLATFORM_AMD__
+    // AMD: shared_avail is a 32-bit shared-address truncation of an int*.
+    // On AMD address spaces are unified so we can reconstitute the pointer
+    // and atomicOr directly.
+    int* avail = reinterpret_cast<int*>(static_cast<uintptr_t>(shared_avail));
+    atomicOr(avail, msg);
+#else
     // TODO(zhiyuang): replace the atomicOr with PTX atom.shared
     asm volatile(
       "red.shared.or.b32 [%0], %1;"
@@ -85,7 +93,7 @@ struct SizeBoundedBarrierAllocQueue : public SizeBoundedBarrierQueue<int, QSIZE>
       : "r"(shared_avail), "r"(msg)
       : "memory"
     );
-    // atomicOr(avail, msg);
+#endif
   }
 
   template<int ThrPush = 0, bool writeback = false, bool free_slot = true> 

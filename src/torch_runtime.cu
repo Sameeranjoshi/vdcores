@@ -1,10 +1,11 @@
+#include "hip/hip_runtime.h"
 #include "dae/runtime.cuh"
 #include "dae/context.cuh"
 
 #include <torch/extension.h>
 
-#include <cuda.h>            // Driver API
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>            // Driver API
+#include <hip/hip_runtime.h>
 
 #include <algorithm>
 #include <cstdlib>
@@ -48,11 +49,11 @@ static inline T* check_tensor_ptr(torch::Tensor t, const char* name) {
   return p;
 }
 
-static cudaDeviceProp current_device_prop() {
-  cudaDeviceProp prop{};
+static hipDeviceProp_t current_device_prop() {
+  hipDeviceProp_t prop{};
   int dev = 0;
-  cudaGetDevice(&dev);
-  cudaGetDeviceProperties(&prop, dev);
+  hipGetDevice(&dev);
+  hipGetDeviceProperties(&prop, dev);
   return prop;
 }
 
@@ -82,7 +83,7 @@ static std::optional<double> env_double(const char* name) {
   return parsed;
 }
 
-static size_t select_persisting_l2_size(const cudaDeviceProp& prop) {
+static size_t select_persisting_l2_size(const hipDeviceProp_t& prop) {
   const size_t max_size = static_cast<size_t>(prop.persistingL2CacheMaxSize);
   if (max_size == 0) {
     return 0;
@@ -119,14 +120,20 @@ static CUtensorMapL2promotion select_tma_l2_promotion() {
 }
 
 static void set_persistent_cache() {
-  const cudaDeviceProp prop = current_device_prop();
+  const hipDeviceProp_t prop = current_device_prop();
 
   // printf("L2 size: %d bytes\n", prop.l2CacheSize);
   // printf("persistingL2CacheMaxSize: %zu bytes\n", prop.persistingL2CacheMaxSize);
   // printf("accessPolicyMaxWindowSize: %zu bytes\n", prop.accessPolicyMaxWindowSize);
 
   const size_t set_aside = select_persisting_l2_size(prop);
-  cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, set_aside);
+#ifdef __HIP_PLATFORM_AMD__
+  // HIP has no persisting-L2-cache limit (CDNA's L2 has no persistent-window
+  // policy). Drop silently so the rest of the launch path works.
+  (void)set_aside;
+#else
+  hipDeviceSetLimit(cudaLimitPersistingL2CacheSize, set_aside);
+#endif
   // printf("persistentCacheSize: %zu bytes\n", set_aside);
 }
 
@@ -153,13 +160,13 @@ int py_launch_dae(
   auto bars = check_tensor_ptr<int>(bars_int32, "bars_int32");
   auto prof = check_tensor_ptr<uint64_t>(profile_u64, "profile_u64");
 
-  cudaError_t st = launch_dae(
+  hipError_t st = launch_dae(
       static_cast<int>(num_sms), smem_size,
       cinst, minst, tma,
       bars, prof, stream
   );
 
-  TORCH_CHECK(st == cudaSuccess, "launch_dae failed: ", cudaGetErrorString(st));
+  TORCH_CHECK(st == hipSuccess, "launch_dae failed: ", hipGetErrorString(st));
 
   // Return something meaningful; often you return profile or nothing.
   return 0;
@@ -264,7 +271,7 @@ torch::Tensor py_build_tma_desc(
   // Fill descriptor in device memory
   CUtensorMap* tma = reinterpret_cast<CUtensorMap*>(desc.data_ptr<uint8_t>());
 
-  CUresult r = cuTensorMapEncodeTiled(
+  hipError_t r = cuTensorMapEncodeTiled(
       tma,
       dtype,
       (cuuint32_t)R,
@@ -279,28 +286,35 @@ torch::Tensor py_build_tma_desc(
       oob
   );
 
-  TORCH_CHECK(r == CUDA_SUCCESS, "cuTensorMapEncodeTiled failed with error code ", r);
+  TORCH_CHECK(r == hipSuccess, "cuTensorMapEncodeTiled failed with error code ", r);
 
   return desc;
 }
 
 enum CachePolicy : int {
-  DAE_CACHE_NORMAL = cudaAccessPropertyNormal,
-  DAE_CACHE_STREAMING = cudaAccessPropertyStreaming,
-  DAE_CACHE_PERSISTING = cudaAccessPropertyPersisting
+  DAE_CACHE_NORMAL = hipAccessPropertyNormal,
+  DAE_CACHE_STREAMING = hipAccessPropertyStreaming,
+  DAE_CACHE_PERSISTING = hipAccessPropertyPersisting
 };
 
 // Set cache policy for a CUDA tensor on the specified stream.
 void py_reset_cache_policy(int64_t stream_id) {
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_id);
-  cudaStreamAttrValue attr{};
+#ifdef __HIP_PLATFORM_AMD__
+  // hipStreamSetAttribute is not exported by torch+rocm 6.4's bundled HIP
+  // runtime (it's a 7.x addition). The access-policy window is a perf hint;
+  // dropping it costs nothing for correctness.
+  (void)stream_id;
+#else
+  hipStream_t stream = reinterpret_cast<hipStream_t>(stream_id);
+  hipLaunchAttributeValue attr{};
   attr.accessPolicyWindow.base_ptr = nullptr;
   attr.accessPolicyWindow.num_bytes = 0;
   attr.accessPolicyWindow.hitRatio = 0.0f;
-  attr.accessPolicyWindow.hitProp = cudaAccessPropertyNormal;
-  attr.accessPolicyWindow.missProp = cudaAccessPropertyNormal;
-  auto err = cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &attr);
-  TORCH_CHECK(err == cudaSuccess, "cudaStreamSetAttribute reset failed: ", cudaGetErrorString(err));
+  attr.accessPolicyWindow.hitProp = hipAccessPropertyNormal;
+  attr.accessPolicyWindow.missProp = hipAccessPropertyNormal;
+  auto err = hipStreamSetAttribute(stream, hipLaunchAttributeAccessPolicyWindow, &attr);
+  TORCH_CHECK(err == hipSuccess, "hipStreamSetAttribute reset failed: ", hipGetErrorString(err));
+#endif
 }
 
 void py_tensor_set_cache_policy(
@@ -314,12 +328,17 @@ void py_tensor_set_cache_policy(
   TORCH_CHECK(t.is_cuda(), "Tensor must be a CUDA tensor");
   TORCH_CHECK(t.numel() > 0, "Tensor must have storage");
 
+#ifdef __HIP_PLATFORM_AMD__
+  // No hipStreamSetAttribute in torch+rocm 6.4's bundled runtime; same
+  // reasoning as py_reset_cache_policy above. Drop the hint silently.
+  (void)stream_id; (void)hit_ratio; (void)hit_policy; (void)miss_policy; (void)num_bytes;
+#else
   // Get the current CUDA stream
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_id);
+  hipStream_t stream = reinterpret_cast<hipStream_t>(stream_id);
 
-  cudaAccessPolicyWindow apw{};
+  hipAccessPolicyWindow apw{};
   apw.base_ptr  = (void*)t.data_ptr();          // some device pointer
-  const cudaDeviceProp prop = current_device_prop();
+  const hipDeviceProp_t prop = current_device_prop();
 
   const size_t tensor_bytes = (size_t)t.numel() * (size_t)t.element_size();
   size_t requested_bytes = tensor_bytes;
@@ -333,13 +352,14 @@ void py_tensor_set_cache_policy(
   apw.num_bytes = requested_bytes;
   apw.hitRatio  = hit_ratio;                    // 0..1
 
-  apw.hitProp = static_cast<cudaAccessProperty>(hit_policy);
-  apw.missProp = static_cast<cudaAccessProperty>(miss_policy);
+  apw.hitProp = static_cast<hipAccessProperty>(hit_policy);
+  apw.missProp = static_cast<hipAccessProperty>(miss_policy);
 
-  cudaStreamAttrValue attr{};
+  hipLaunchAttributeValue attr{};
   attr.accessPolicyWindow = apw;
-  auto err = cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &attr);
-  TORCH_CHECK(err == cudaSuccess, "cudaStreamSetAttribute failed: ", cudaGetErrorString(err));
+  auto err = hipStreamSetAttribute(stream, hipLaunchAttributeAccessPolicyWindow, &attr);
+  TORCH_CHECK(err == hipSuccess, "hipStreamSetAttribute failed: ", hipGetErrorString(err));
+#endif
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

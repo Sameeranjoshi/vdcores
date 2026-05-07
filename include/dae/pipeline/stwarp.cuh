@@ -1,6 +1,87 @@
+#include "hip/hip_runtime.h"
 #pragma once
 
 #include "virtualcore.cuh"
+
+#ifdef __HIP_PLATFORM_AMD__
+// AMD: real ST pipeline for the 1-D LDS -> global path used by tmacopy.py.
+// Hopper's cp_async_bulk + commit_group / wait_group is replaced with a
+// synchronous wide-store loop. We threadfence before the store so prior LDS
+// writes from compute warps are visible, and threadfence_system after the
+// store before decrementing the global barrier so other CTAs / the host see
+// the write.
+template<typename C2M_Type>
+__device__ __forceinline__ void stwarp_execute_singlethread(
+    C2M_Type &c2m, const MInst* slot_insts,
+    const void *smem_base, const CUtensorMap *tma_descs, int *bars) {
+
+  __stprint("[ST Warp][AMD] Start ST warp execution");
+
+  int slot_mask = c2m.pop();
+  while (slot_mask) {
+
+    auto slot = extract(slot_mask);
+    bool do_free = true;
+
+    __stprint("Receive ST slot: slot=%d", slot);
+
+    auto &inst = slot_insts[slot];
+    uint16_t opcode = inst.opcode;
+
+    switch(op(opcode)) {
+      case op(OP_ALLOC_WB_TMA_STORE_1D): {
+        __stprint("[AMD] 1D Store: size=%d", inst.size);
+        const char* __restrict__ src =
+            reinterpret_cast<const char*>(get_slot_address(smem_base, slot));
+        char* __restrict__ dst =
+            reinterpret_cast<char*>(inst.address);
+        const size_t n = inst.size;
+        // Make sure compute's LDS writes are visible to this lane before we
+        // copy out.
+        __threadfence_block();
+        const uintptr_t srcaddr = reinterpret_cast<uintptr_t>(src);
+        const uintptr_t dstaddr = reinterpret_cast<uintptr_t>(dst);
+        if (((srcaddr | dstaddr) & 0xF) == 0 && (n & 0xF) == 0) {
+          const uint4* __restrict__ s4 = reinterpret_cast<const uint4*>(src);
+          uint4* __restrict__ d4 = reinterpret_cast<uint4*>(dst);
+          const size_t n16 = n >> 4;
+          #pragma unroll 1
+          for (size_t i = 0; i < n16; ++i) d4[i] = s4[i];
+        } else {
+          #pragma unroll 1
+          for (size_t i = 0; i < n; ++i) dst[i] = src[i];
+        }
+        break;
+      }
+      default:
+        // Multi-D TMA stores / reduce-add are not implemented on AMD.
+        // Don't free the slot — this is unrecoverable.
+        __stprint("Unsupported ST opcode on AMD: slot=%d op=%d opcode=%04x",
+                  slot, op(inst.opcode), inst.opcode);
+        do_free = false;
+        __builtin_trap();
+        break;
+    }
+
+    if (opcode & MEM_OP_FLAGS_BARRIER) {
+      // Make the global write visible across the device before the barrier
+      // decrement. Hopper relies on cp.async.bulk's group-fence semantics;
+      // here we issue an explicit device-scope fence.
+      __threadfence();
+      atomicSub(&bars[inst.bar()], 1);
+    }
+
+    __stprint("finish slot=%d op=%d flags=%02x",
+      slot, op(inst.opcode), opcode & ((1 << flagBits) - 1));
+
+    if (do_free)
+      c2m.reset(slot_mask);
+    slot_mask = c2m.pop();
+  }
+
+  __stprint("[AMD] End of ST warp execution");
+}
+#else
 
 // TODO(zhiyuang): attach bars to the writeback
 template<typename C2M_Type>
@@ -175,3 +256,5 @@ __device__ __forceinline__ void stwarp_execute_singlethread(
 
   __stprint("End of ST warp execution");
 }
+
+#endif  // __HIP_PLATFORM_AMD__

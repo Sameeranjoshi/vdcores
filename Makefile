@@ -1,12 +1,28 @@
 # Makefile for DAE kernel (multi-file build)
+#
+# Toolchains:
+#   default          -> nvcc, sm_90a (Hopper)
+#   make HIP=1 ...   -> hipcc, gfx942 (MI300X). See PORT_STATUS.md.
 
-# CUDA compiler
-NVCC = nvcc
 PYTHON ?= python
 
-# CUDA architecture (adjust for your GPU)
-# SM80 for A100, SM89 for H100, SM90 for Hopper
-CUDA_ARCH = -gencode arch=compute_90a,code=sm_90a
+ifeq ($(HIP),1)
+  # ---- AMD HIP path ----
+  NVCC = hipcc
+  HIP_ARCH ?= gfx942
+  CUDA_ARCH = --offload-arch=$(HIP_ARCH)
+  LDFLAGS = -lamdhip64
+  NVCC_FLAGS = -O3 -Iinclude/dae -Iinclude -I$(GENERATED_INCLUDE_DIR) -std=c++20 -D__HIP_PLATFORM_AMD__ -D__AMDGCN_WAVEFRONT_SIZE=64 -fPIC
+  PIC_FLAG :=
+else
+  # ---- NVIDIA CUDA path ----
+  NVCC = nvcc
+  # SM80 for A100, SM89 for H100, SM90 for Hopper
+  CUDA_ARCH = -gencode arch=compute_90a,code=sm_90a
+  LDFLAGS = -lcuda -lcublas
+  NVCC_FLAGS = -O3 -Iinclude/dae -Iinclude -I$(GENERATED_INCLUDE_DIR) -std=c++20 -Xptxas=-v -use_fast_math -lineinfo
+  PIC_FLAG := -Xcompiler -fPIC
+endif
 
 GENERATED_INCLUDE_DIR := build/generated
 SELECTED_COMPUTE_OPS := $(GENERATED_INCLUDE_DIR)/dae/selected_compute_ops.inc
@@ -16,15 +32,6 @@ COMPUTE_OP_GENERATED_STAMP := $(GENERATED_INCLUDE_DIR)/dae/compute_ops.generated
 COMPUTE_DISPATCH := include/dae/compute_dispatch.cuh
 OPCODE_REGISTRY := include/dae/opcode.cuh.inc
 COMPUTE_OP_GENERATOR := tools/generate_selected_compute_ops.py
-
-# Compiler flags
-# NVCC_FLAGS = -DNDEBUG -O3 -std=c++20 $(if $(profile),-DDAE_PROFILE) # --ptxas-options=--verbose
-
-# Linker flags (add CUDA driver library for TMA support)
-LDFLAGS = -lcuda -lcublas
-
-NVCC_FLAGS = -O3 -Iinclude/dae -Iinclude -I$(GENERATED_INCLUDE_DIR) -std=c++20 -Xptxas=-v -use_fast_math
-NVCC_FLAGS += -lineinfo
 
 # Directories
 ifeq ($(debug),)
@@ -70,7 +77,7 @@ $(COMPUTE_OP_GENERATED_STAMP): FORCE $(COMPUTE_OP_GENERATOR) $(COMPUTE_DISPATCH)
 $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS): $(COMPUTE_OP_GENERATED_STAMP)
 
 runtime.o: src/runtime.cu $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS) $(HEADERS)
-	$(NVCC) $(CUDA_ARCH) $(NVCC_FLAGS) -Xcompiler -fPIC -c -o $@ $<
+	$(NVCC) $(CUDA_ARCH) $(NVCC_FLAGS) $(PIC_FLAG) -c -o $@ $<
 
 %: $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS)
 
@@ -78,7 +85,11 @@ run: $(BIN)
 	./$<
 
 pyext: $(SELECTED_COMPUTE_OPS) $(COMPUTE_OPCODE_ORDER) $(DYNAMIC_COMPUTE_HANDLERS) $(TARGETS)
+ifeq ($(HIP),1)
+	HIP=1 HIP_ARCH=$(HIP_ARCH) pip install -e . --no-build-isolation
+else
 	pip install -e . --no-build-isolation
+endif
 
 FORCE:
 

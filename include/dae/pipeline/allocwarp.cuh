@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 #pragma once
 
 #include "virtualcore.cuh"
@@ -23,6 +24,16 @@ __device__ __forceinline__ void allocwarp_execute(
 ) {
   static_assert(numSlots < 32, "Too many slots for single warp");
 
+#if defined(__HIP_PLATFORM_AMD__) && defined(DAE_DEBUG_PRINT)
+  if (threadIdx.x == 128) {
+    printf("[%d][CFU-PROBE-A] allocwarp body reached, tx=128\n", (int)blockIdx.x);
+  }
+  __threadfence();
+  if (threadIdx.x == 128) {
+    printf("[%d][CFU-PROBE-B] allocwarp past threadfence, tx=128\n", (int)blockIdx.x);
+  }
+#endif
+
   // register flags
   MInst inst;
   uint32_t pc = 0, next_pc = 0;
@@ -36,7 +47,18 @@ __device__ __forceinline__ void allocwarp_execute(
   __syncwarp();
 
   while (di.pred_continue) {
+#if defined(__HIP_PLATFORM_AMD__) && defined(DAE_DEBUG_PRINT)
+    if (threadIdx.x == 128) {
+      printf("[%d][CFU-LOOP-ENTER] tx=128 next_pc=%u\n", (int)blockIdx.x, next_pc);
+    }
+#endif
     inst = smem_minsts[next_pc % numInsts];
+#if defined(__HIP_PLATFORM_AMD__) && defined(DAE_DEBUG_PRINT)
+    if (threadIdx.x == 128) {
+      printf("[%d][CFU-AFTER-INST-LOAD] tx=128 opcode=%04x\n",
+             (int)blockIdx.x, (unsigned)inst.opcode);
+    }
+#endif
     // async zone after all shared memory read
     // IF/ID
     // 1. try to fetch a instruction
@@ -44,6 +66,12 @@ __device__ __forceinline__ void allocwarp_execute(
     pc = next_pc;
     prefetch_inst_window(lane_id, smem_minsts, pc + 2);
     uint64_t addr_accum = __shfl_sync(0xFFFFFFFF, di.gpr[1], pc - di.loop_start_pc);
+#if defined(__HIP_PLATFORM_AMD__) && defined(DAE_DEBUG_PRINT)
+    if (threadIdx.x == 128) {
+      printf("[%d][CFU-AFTER-SHFL] tx=128 pc=%u opcode=%04x\n",
+             (int)blockIdx.x, pc, (unsigned)inst.opcode);
+    }
+#endif
 
     __mprint("[exec][pc=%d]: opcode=%04x m2c.ptr=%d m2ld[0].ptr=%d m2ld[1].ptr=%d",
             pc, inst.opcode, m2c.ptr, m2ld[0].ptr, m2ld[1].ptr);
@@ -103,6 +131,10 @@ __device__ __forceinline__ void allocwarp_execute(
       // TODO(zhiyuang): do we need this syncwarp here?
       // __syncwarp();
       if (lane_id == 0) {
+#if defined(__HIP_PLATFORM_AMD__) && defined(DAE_DEBUG_PRINT)
+        printf("[%d][CFU-PRE-PUSH] tx=128 slot=%d port=%d m2c.ptr=%u\n",
+               (int)blockIdx.x, di.slot_alloc, di.port, m2c.ptr);
+#endif
         st_insts[di.slot_alloc] = inst;
         m2c.put(alloc_mask);
 
@@ -116,6 +148,10 @@ __device__ __forceinline__ void allocwarp_execute(
         m2c.advance();
         curld.commit();
         curld.advance();
+#if defined(__HIP_PLATFORM_AMD__) && defined(DAE_DEBUG_PRINT)
+        printf("[%d][CFU-POST-PUSH] tx=128 slot=%d arrived on m2ld[%d]\n",
+               (int)blockIdx.x, di.slot_alloc, di.port);
+#endif
       }
 
       // have to keep this branch

@@ -214,7 +214,11 @@ class ResourceGroup:
 
 class Launcher:
     def __init__(self, num_sms : int = 1, device = 'cuda'):
-        self.smem_size = 202 * 1024 # 202 KB
+        # Dynamic LDS = the slot pool. Computed from runtime.config so the
+        # AMD path (smaller numSlots, fits in 64 KB CDNA LDS) and the NVIDIA
+        # path (24 * 8 KB) both work without manual tuning.
+        slack = 4 * 1024  # alignment + safety margin
+        self.smem_size = config.num_slots * config.slot_size + slack
         self.num_sms = num_sms
         self.device = device
 

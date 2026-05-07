@@ -1,7 +1,16 @@
+#include "hip/hip_runtime.h"
 #pragma once
 
 #include "context.cuh"
 #include "type.cuh"
+
+#ifdef __HIP_PLATFORM_AMD__
+// AMD STUB: rms_norm relies on bf16-vector intrinsics (__hfma2, __hmul2,
+// __bfloat162float) that aren't directly available on conda-forge HIP headers.
+// Replace with a hand-written rms_norm using fp32 reductions on AMD.
+template <int HIDDIM_SIZE, typename T, typename... Args>
+__device__ __forceinline__ void task_rms_norm_f16_from_smem(Args&&...) { __builtin_trap(); }
+#else
 
 template<int HIDDIM_SIZE, int N_COMPUTE_THREAD, typename T>
 __device__ __forceinline__ void _rms_helper_one_row(
@@ -132,3 +141,5 @@ __device__ __forceinline__ void task_rms_norm_f16_from_smem(
   c2m.push(thread_id, in_addr_slot | weights_slot);
 }
 
+
+#endif  // __HIP_PLATFORM_AMD__

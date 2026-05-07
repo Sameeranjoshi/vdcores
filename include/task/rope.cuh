@@ -1,14 +1,21 @@
+#include "hip/hip_runtime.h"
 #pragma once
 
 #include <cmath>
+
+#ifdef __HIP_PLATFORM_AMD__
+// AMD STUB: rope uses CuTe layouts. Variadic stub keeps dispatch compiling.
+template <int N, typename... Args>
+__device__ __forceinline__ void task_rope_interleaved(Args&&...) { __builtin_trap(); }
+#else
 #include <cute/tensor.hpp>
-#include <cute/arch/mma_sm90.hpp>      // SM80_16x8x16_F16F16F16F16_TN
-#include <cute/atom/mma_atom.hpp>      // MMA_Atom / make_tiled_mma
-#include <cute/algorithm/gemm.hpp>     // cute::gemm
-#include <cute/algorithm/tensor_reduce.hpp>     // cute::reduce
-#include <cute/algorithm/tensor_algorithms.hpp>     // cute::reduce
+#include <cute/arch/mma_sm90.hpp>
+#include <cute/atom/mma_atom.hpp>
+#include <cute/algorithm/gemm.hpp>
+#include <cute/algorithm/tensor_reduce.hpp>
+#include <cute/algorithm/tensor_algorithms.hpp>
 #include <cute/algorithm/functional.hpp>
-#include <cute/algorithm/axpby.hpp> // cute::axpby
+#include <cute/algorithm/axpby.hpp>
 #include <cute/layout.hpp>
 #include <cutlass/array.h>
 #include <cutlass/cutlass.h>
@@ -55,7 +62,7 @@ struct NormRope {
             float sum = 0.0f;
             #pragma unroll
             for (int i = lane_in_one_token; i < num_thread_per_token; i += num_thread_per_token) {
-                __nv_bfloat162 val = input(r, i);
+                __hip_bfloat162 val = input(r, i);
                 float2 val_f32 = __bfloat1622float2(val);
                 sum += val_f32.x * val_f32.x + val_f32.y * val_f32.y;
             }
@@ -83,7 +90,7 @@ struct NormRope {
             const int logical_token_id_in_glob = token_glob_ofst + r / NUM_HEAD;
             #pragma unroll
             for (int i = lane_in_one_token; i < num_thread_per_token; i += num_thread_per_token) {
-                __nv_bfloat162 val = input(r, i);
+                __hip_bfloat162 val = input(r, i);
                 float2 val_f32 = __bfloat1622float2(val);
 
                 // apply norm
@@ -124,7 +131,7 @@ struct NormRope {
         for (int r = ofst_in_token_group; r < num_token; r += token_group_size) {
             #pragma unroll
             for (int i = lane_in_one_token; i < num_thread_per_token; i += num_thread_per_token) {
-                __nv_bfloat162 val = input(i, r);
+                __hip_bfloat162 val = input(i, r);
                 float2 val_f32 = __bfloat1622float2(val);
 
                 // apply rope
@@ -145,7 +152,7 @@ void task_rope_interleaved(
     void *base, M2CType &m2c, C2MType &c2m
 ) {
     static_assert(N % 2 == 0, "N must be even for vectorized rope");
-    using vec_t = __nv_bfloat162;
+    using vec_t = __hip_bfloat162;
 
     int thread_id = threadIdx.x;
 
@@ -168,3 +175,5 @@ void task_rope_interleaved(
     // they cannot be merged, when one of them could be local
     c2m.push(thread_id, in_slot | table_slot);
 }
+
+#endif  // __HIP_PLATFORM_AMD__

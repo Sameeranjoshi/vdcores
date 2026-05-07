@@ -1,14 +1,25 @@
+#include "hip/hip_runtime.h"
 #pragma once
 
-#include <cuda.h>
+#include <hip/hip_runtime.h>
+#include "context.cuh"
+#include "type.cuh"
+
+#ifdef __HIP_PLATFORM_AMD__
+// AMD STUB: silu uses CuTe MMA atoms which have no AMD equivalent in this tree.
+// Provide variadic-template stubs so compute_dispatch.cuh compiles. Calling
+// these on AMD traps so silently-bad runs are impossible.
+template <int N, typename... Args>
+__device__ __forceinline__ void task_silu_smem_1D(Args&&...) { __builtin_trap(); }
+template <int N, typename... Args>
+__device__ __forceinline__ void task_silu_smem(Args&&...) { __builtin_trap(); }
+#else  // CUDA path: real implementation below
+
 #include <cute/tensor.hpp>
 #include <cute/arch/mma_sm80.hpp>      // SM80_16x8x16_F16F16F16F16_TN
 #include <cute/arch/mma_sm90.hpp>      // SM80_16x8x16_F16F16F16F16_TN
 #include <cute/atom/mma_atom.hpp>      // MMA_Atom / make_tiled_mma
 #include <cute/algorithm/gemm.hpp>     // cute::gemm
-
-#include "context.cuh"
-#include "type.cuh"
 
 template<typename T>
 __device__ __forceinline__ T silu_and_mul(T x, T mul) {
@@ -130,8 +141,8 @@ __device__ __forceinline__ void task_silu_smem(
     M2C_Type& m2c,
     C2M_Type& c2m
 ) {
-    using data_t = __nv_bfloat16;
-    using fetch_t = __nv_bfloat162;
+    using data_t = __hip_bfloat16;
+    using fetch_t = __hip_bfloat162;
 
     const int slot_out = m2c.pop();
     fetch_t *sOut = (fetch_t *)get_slot_address(base, extract(slot_out));
@@ -167,8 +178,8 @@ __device__ __forceinline__ void task_silu_smem_1D(
     M2C_Type& m2c,
     C2M_Type& c2m
 ) {
-    using data_t = __nv_bfloat16;
-    using fetch_t = __nv_bfloat162;
+    using data_t = __hip_bfloat16;
+    using fetch_t = __hip_bfloat162;
 
     const int slot_out = m2c.pop();
     fetch_t *sOut = (fetch_t *)get_slot_address(base, extract(slot_out));
@@ -188,3 +199,5 @@ __device__ __forceinline__ void task_silu_smem_1D(
     // a write push ensures the threading order
     c2m.template push<0>(threadIdx.x, slot_gate | slot_up);
 }
+
+#endif  // __HIP_PLATFORM_AMD__

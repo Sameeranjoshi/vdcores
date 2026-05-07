@@ -2,10 +2,16 @@
 
 #include "virtualcore.cuh"
 
+#ifdef __HIP_PLATFORM_AMD__
+// AMD STUB: WGMMA is Hopper-only. Replace with MFMA on CDNA3.
+template <typename Atom, int M, int N, int K, int b_load_interval, bool residual,
+          typename... Args>
+__device__ __forceinline__ void task_gemm(Args&&...) { __builtin_trap(); }
+#else
 #include <cute/tensor.hpp>
-#include <cute/arch/mma_sm90.hpp>      // SM80_16x8x16_F16F16F16F16_TN
-#include <cute/atom/mma_atom.hpp>      // MMA_Atom / make_tiled_mma
-#include <cute/algorithm/gemm.hpp>     // cute::gemm
+#include <cute/arch/mma_sm90.hpp>
+#include <cute/atom/mma_atom.hpp>
+#include <cute/algorithm/gemm.hpp>
 
 template<typename Atom, int M, int N, int K,
          int b_load_interval, bool residual,
@@ -118,3 +124,5 @@ __device__ __forceinline__ void task_gemm(
     copy(frag_C, thr_sC);
     c2m.template push<0, true>(thread_id, slot_c); // commit the output tile
 }
+
+#endif  // __HIP_PLATFORM_AMD__
