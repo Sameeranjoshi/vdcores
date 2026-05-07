@@ -30,18 +30,25 @@ def run(num_blocks: int, num_chunks: int, n_iters: int = 50, seed: int = 0):
     K = K_PER_CHUNK * num_chunks   # K_global per block
     M_total = num_blocks * M_PER_BLOCK
 
-    # Native chunked layout so each chunk's TmaLoad1D source is contiguous.
-    # A[c, m, p] holds the p-th element of chunk c for row m. Slicing
-    # A[c, m_lo:m_hi, :] is a dim-0 slice of a contiguous 2D view -> contiguous.
+    # Native chunked layouts so each chunk's TmaLoad1D source is contiguous.
+    # A[c, m, p] holds the p-th K-elem of chunk c for row m: slicing
+    #   A[c, m_lo:m_hi, :] is contiguous in (M, K) row-major.
+    # B[c, n, p] holds the p-th K-elem of chunk c for column n: slicing
+    #   B[c, :, :] is contiguous in (N, K) row-major. This matches the
+    #   layout AMD MFMA expects (sB[n * K_chunk + k]) and what 2D TMA
+    #   loads of an app/python (N, K) matB produce after the K-block fold.
     A_chunked = (torch.rand(num_chunks, M_total, K_PER_CHUNK,
                             dtype=torch.bfloat16, device=gpu) - 0.5)
-    B_chunked = (torch.rand(num_chunks, K_PER_CHUNK, N,
+    B_chunked = (torch.rand(num_chunks, N, K_PER_CHUNK,
                             dtype=torch.bfloat16, device=gpu) - 0.5)
     C = torch.zeros(M_total, N, dtype=torch.bfloat16, device=gpu)
 
     # Reference: assemble the logical (M, K) and (K, N) views.
     A_logical = A_chunked.permute(1, 0, 2).contiguous().reshape(M_total, K)
-    B_logical = B_chunked.reshape(K, N)
+    # B_chunked is (num_chunks, N, K_PER_CHUNK). Permute to (num_chunks,
+    # K_PER_CHUNK, N) so chunk-major K → outer index, then flatten chunks
+    # into the K dimension to get (K, N).
+    B_logical = B_chunked.permute(0, 2, 1).reshape(K, N).contiguous()
 
     dae = Launcher(num_sms=num_blocks, device=gpu)
 

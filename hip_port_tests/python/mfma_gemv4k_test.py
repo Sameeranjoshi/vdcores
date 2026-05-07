@@ -36,18 +36,21 @@ def run(num_blocks: int, num_chunks: int, n_iters: int = 50, seed: int = 0):
     K = K_PER_CHUNK * num_chunks   # K_global per block
     M_total = num_blocks * M_PER_BLOCK
 
-    # Native chunked layout so each chunk's TmaLoad1D source is contiguous.
-    # A[c, m, p] holds the p-th element of chunk c for row m. Slicing
-    # A[c, m_lo:m_hi, :] is a dim-0 slice of a contiguous 2D view -> contiguous.
+    # Native chunked layouts so each chunk's TmaLoad1D source is contiguous.
+    # A[c, m, p] = p-th K-elem of chunk c for row m: (M, K) row-major.
+    # B[c, n, p] = p-th K-elem of chunk c for column n: (N, K) row-major
+    #             matches AMD MFMA's sB[n*K_chunk+k] addressing.
     A_chunked = (torch.rand(num_chunks, M_total, K_PER_CHUNK,
                             dtype=torch.bfloat16, device=gpu) - 0.5)
-    B_chunked = (torch.rand(num_chunks, K_PER_CHUNK, N,
+    B_chunked = (torch.rand(num_chunks, N, K_PER_CHUNK,
                             dtype=torch.bfloat16, device=gpu) - 0.5)
     C = torch.zeros(M_total, N, dtype=torch.bfloat16, device=gpu)
 
     # Reference: assemble the logical (M, K) and (K, N) views.
     A_logical = A_chunked.permute(1, 0, 2).contiguous().reshape(M_total, K)
-    B_logical = B_chunked.reshape(K, N)
+    # Permute B (num_chunks, N, K_PER_CHUNK) -> (num_chunks, K_PER_CHUNK, N),
+    # then flatten chunks into K to get (K_total, N) for the matmul reference.
+    B_logical = B_chunked.permute(0, 2, 1).reshape(K, N).contiguous()
 
     dae = Launcher(num_sms=num_blocks, device=gpu)
 

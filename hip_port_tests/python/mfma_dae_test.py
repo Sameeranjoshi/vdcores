@@ -26,8 +26,11 @@ def run_one(M_blocks: int, K_iters: int, seed: int = 0):
     torch.manual_seed(seed)
     M = M_blocks * 16
     K = K_iters * 16
-    A = (torch.rand(M, K,  dtype=torch.bfloat16, device=gpu) - 0.5)
-    B = (torch.rand(K, 16, dtype=torch.bfloat16, device=gpu) - 0.5)
+    A = (torch.rand(M,  K, dtype=torch.bfloat16, device=gpu) - 0.5)
+    # B is laid out (N=16, K) row-major in memory. AMD MFMA reads
+    # sB[n * K + k], matching this layout. Linear TmaLoad1D copies the
+    # bytes contiguously into LDS slot B.
+    B = (torch.rand(16, K, dtype=torch.bfloat16, device=gpu) - 0.5)
     C = torch.zeros(M, 16, dtype=torch.bfloat16, device=gpu)
 
     dae = Launcher(num_sms=1, device=gpu)
@@ -45,7 +48,8 @@ def run_one(M_blocks: int, K_iters: int, seed: int = 0):
     dae.launch()
     torch.cuda.synchronize()
 
-    ref = (A.to(torch.float32) @ B.to(torch.float32)).to(torch.bfloat16)
+    # Reference: C = A @ B^T because B is now (N, K) instead of (K, N).
+    ref = (A.to(torch.float32) @ B.to(torch.float32).T).to(torch.bfloat16)
     diff = (C.to(torch.float32) - ref.to(torch.float32)).abs()
 
     times_ns = []

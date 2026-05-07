@@ -48,7 +48,8 @@ def run(num_blocks: int, n_iters: int = 50, seed: int = 0):
     torch.manual_seed(seed)
     M_total = num_blocks * M_PER_BLOCK
     A = (torch.rand(M_total, K, dtype=torch.bfloat16, device=gpu) - 0.5)
-    B = (torch.rand(K,       N, dtype=torch.bfloat16, device=gpu) - 0.5)
+    # B is laid out (N, K) row-major in memory. AMD MFMA reads sB[n*K+k].
+    B = (torch.rand(N,       K, dtype=torch.bfloat16, device=gpu) - 0.5)
     C = torch.zeros(M_total, N, dtype=torch.bfloat16, device=gpu)
 
     dae = Launcher(num_sms=num_blocks, device=gpu)
@@ -70,7 +71,8 @@ def run(num_blocks: int, n_iters: int = 50, seed: int = 0):
     dae.launch()
     torch.cuda.synchronize()
 
-    ref = (A.to(torch.float32) @ B.to(torch.float32)).to(torch.bfloat16)
+    # C = A @ B^T because B is now (N, K) instead of (K, N).
+    ref = (A.to(torch.float32) @ B.to(torch.float32).T).to(torch.bfloat16)
     diff = (C.to(torch.float32) - ref.to(torch.float32)).abs()
     max_e, mean_e = diff.max().item(), diff.mean().item()
 

@@ -525,13 +525,18 @@ void dae2(
         dae_amd_arrive(compute_done);
       }
     } else if (is_mfma_mode) {
-      // bf16 (M_total x N=16) = (M_total x K_global) @ (K_global x 16) matmul,
+      // bf16 (M_total x N=16) = (M_total x K_global) @ (16 x K_global)^T matmul,
       // where M_total  = mfma_m_blocks * 16
       //   and K_chunk  = mfma_k_iters  * 16   (K per atom call, fits in slot A)
       //   and K_global = K_chunk * mfma_num_chunks  (cross-atom-call total).
       //
-      // Slot A holds the current chunk's A[M_total, K_chunk] bf16 row-major,
-      // slot B holds the current chunk's B[K_chunk, 16] bf16 row-major.
+      // Slot A holds the current chunk's A[M_total, K_chunk] bf16 row-major
+      //   (M outer, K inner — sA[m * K_chunk + k]).
+      // Slot B holds the current chunk's B[16, K_chunk] bf16 row-major
+      //   (N outer, K inner — sB[n * K_chunk + k]). This matches the layout
+      //   produced by 2D TMA loads of a (N=16, K=K_total) row-major matB,
+      //   and is also what hip_port_tests/python/mfma_gemv_wgmma_test.py
+      //   provides via TmaLoad1D over a (num_chunks, N, K) tensor.
       // Per-lane fp32 accumulators persist across chunks (wave 0, 64 lanes,
       // M_blocks accumulators each — registers, no LDS).
       //
@@ -579,7 +584,7 @@ void dae2(
               bf16x4 a, b;
               for (int i = 0; i < 4; ++i) {
                 __hip_bfloat16 av = sA[(m_base + row_in16) * K_chunk + (k_base + kblk_id * 4 + i)];
-                __hip_bfloat16 bv = sB[(k_base + kblk_id * 4 + i) * 16 + col];
+                __hip_bfloat16 bv = sB[col * K_chunk + (k_base + kblk_id * 4 + i)];
                 int16_t ai, bi;
                 __builtin_memcpy(&ai, &av, sizeof(ai));
                 __builtin_memcpy(&bi, &bv, sizeof(bi));
