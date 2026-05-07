@@ -127,6 +127,34 @@ using cute::tile_to_shape;
 // CUDA TMA descriptor type — replace with opaque stub on AMD.
 using CUtensorMap = struct { uint64_t opaque[16]; };
 
+// AMD-only: structured overlay of CUtensorMap's 128 bytes used to store the
+// information the AMD MInst interpreter needs to perform a multi-dimensional
+// global→shared copy without relying on a real TMA engine.
+//
+// magic = 0x54444D41 ('AMDT' little-endian) so the dae2 interpreter can sanity
+// check that the descriptor was populated by us (vs. zero-filled or stale).
+//
+// Layout fits in sizeof(CUtensorMap) = 16 * 8 = 128 bytes (see static_assert
+// after the struct). Strides are stored in BYTES so the address math is
+//   addr = base_addr + sum_i ( coords[i] * gstride[i] )  for the box origin,
+// and the inner box is then walked using bdim[]/elsize.
+struct AmdTmaDesc {
+  uint32_t magic;          // 0x54444D41 sentinel
+  uint8_t  rank;           // 1..5 (matches NVIDIA encodeTiled tensorRank)
+  uint8_t  elsize;         // bytes per element (e.g. 2 for bf16/fp16)
+  uint16_t reserved;
+  uint64_t base_addr;      // global pointer to the tensor base
+  uint32_t gdim[5];        // global tensor extents (only first `rank` valid)
+  uint64_t gstride[5];     // strides in BYTES; gstride[rank-1] = 0 (unused)
+  uint32_t bdim[5];        // box (tile) extents
+  uint32_t estride[5];     // element stride within the box (usually 1)
+};
+
+static_assert(sizeof(AmdTmaDesc) <= sizeof(CUtensorMap),
+              "AmdTmaDesc must fit in 128 bytes (sizeof CUtensorMap)");
+
+constexpr uint32_t AMD_TMA_DESC_MAGIC = 0x54444D41u;  // 'AMDT'
+
 // CUDA driver-API integer typedefs used by torch_runtime.cu's host-side
 // TMA-descriptor builder. These are CUDA-specific; on AMD nothing actually
 // reads them at runtime (cuTensorMapEncodeTiled is itself stubbed below) but
@@ -171,17 +199,62 @@ enum : int {
   CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE    = 0,
 };
 
-// Host-only stub: this is called from src/runtime.cu's NVIDIA branch only,
-// but src/torch_runtime.cu calls it unconditionally on the AMD build. Returns
-// hipSuccess and zero-fills the descriptor — anything that actually consumes
-// the descriptor is itself stubbed (multi-D TMA in ldwarp/stwarp traps).
+// Host-side helper: convert CUtensorMapDataType to byte size. Defined after
+// the enum constants so the case labels are visible.
+__host__ inline uint8_t amd_tma_elsize_from_dtype(int dtype) {
+  switch (dtype) {
+    case CU_TENSOR_MAP_DATA_TYPE_UINT8:    return 1;
+    case CU_TENSOR_MAP_DATA_TYPE_UINT16:   return 2;
+    case CU_TENSOR_MAP_DATA_TYPE_FLOAT16:  return 2;
+    case CU_TENSOR_MAP_DATA_TYPE_BFLOAT16: return 2;
+    case CU_TENSOR_MAP_DATA_TYPE_UINT32:   return 4;
+    case CU_TENSOR_MAP_DATA_TYPE_INT32:    return 4;
+    case CU_TENSOR_MAP_DATA_TYPE_FLOAT32:  return 4;
+    case CU_TENSOR_MAP_DATA_TYPE_UINT64:   return 8;
+    case CU_TENSOR_MAP_DATA_TYPE_INT64:    return 8;
+    default:                               return 0;  // unknown
+  }
+}
+
+// Host-only: AMD replacement for the CUDA driver builder. Populates the
+// CUtensorMap storage with our AmdTmaDesc layout so the AMD MInst interpreter
+// can perform multi-dimensional copies without a real TMA engine.
+//
+// Swizzle / L2 promotion / OOB fill are NVIDIA-specific perf hints; we record
+// nothing and treat the descriptor as "no-swizzle, fill-zero" semantics. This
+// is fine for correctness on data that exists; it would skip OOB padding that
+// real TMA can do on NVIDIA, but our compute paths on AMD don't rely on that.
 __host__ inline hipError_t cuTensorMapEncodeTiled(
-    CUtensorMap* tma, CUtensorMapDataType, cuuint32_t,
-    void*, const cuuint64_t*, const cuuint64_t*,
-    const cuuint32_t*, const cuuint32_t*,
-    CUtensorMapInterleave, CUtensorMapSwizzle,
-    CUtensorMapL2promotion, CUtensorMapFloatOOBfill) {
-  if (tma) *tma = CUtensorMap{};
+    CUtensorMap* tma,
+    CUtensorMapDataType dtype,
+    cuuint32_t rank,
+    void* base,
+    const cuuint64_t* global_dims,
+    const cuuint64_t* global_strides,
+    const cuuint32_t* box_dims,
+    const cuuint32_t* element_strides,
+    CUtensorMapInterleave,
+    CUtensorMapSwizzle,
+    CUtensorMapL2promotion,
+    CUtensorMapFloatOOBfill) {
+  if (tma == nullptr) return hipErrorInvalidValue;
+  if (rank == 0 || rank > 5) return hipErrorInvalidValue;
+  *tma = CUtensorMap{};
+  AmdTmaDesc* d = reinterpret_cast<AmdTmaDesc*>(tma);
+  d->magic     = AMD_TMA_DESC_MAGIC;
+  d->rank      = static_cast<uint8_t>(rank);
+  d->elsize    = amd_tma_elsize_from_dtype(static_cast<int>(dtype));
+  d->reserved  = 0;
+  d->base_addr = reinterpret_cast<uint64_t>(base);
+  for (uint32_t i = 0; i < rank; ++i) {
+    d->gdim[i]    = static_cast<uint32_t>(global_dims ? global_dims[i] : 0);
+    d->gstride[i] = global_strides ? static_cast<uint64_t>(global_strides[i]) : 0;
+    d->bdim[i]    = box_dims ? box_dims[i] : 0;
+    d->estride[i] = element_strides ? element_strides[i] : 1;
+  }
+  for (uint32_t i = rank; i < 5; ++i) {
+    d->gdim[i] = 0; d->gstride[i] = 0; d->bdim[i] = 0; d->estride[i] = 0;
+  }
   return hipSuccess;
 }
 

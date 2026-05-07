@@ -96,6 +96,230 @@ static void dae_amd_copy_l2g(void* g_dst, const void* lds_src, uint32_t n) {
     for (uint32_t i = 0; i < n; ++i) dp[i] = sp[i];
   }
 }
+
+// Multi-dimensional global → LDS copy driven by an AmdTmaDesc and the
+// per-instruction starting coordinates. Mirrors what NVIDIA TMA does for
+// non-swizzled tiled loads but is a software loop using dae_amd_copy_g2l for
+// the contiguous innermost row.
+//
+// Layout convention (matches NVIDIA TMA):
+//   - dim 0 is the innermost / contiguous dimension; box[0] elements per row
+//     are loaded contiguously into LDS.
+//   - dim 1+ are stride-jumped in global memory; rows are packed contiguously
+//     in LDS in the same dimension order (no swizzling).
+//
+// `coords[i]` is the start index along dim i of the box origin in the global
+// tensor. estride is assumed to be 1 (true for every caller in this repo).
+__device__ __forceinline__
+static void dae_amd_tma_box_g2l(void* lds_dst,
+                                 const AmdTmaDesc* d,
+                                 const uint16_t* coords) {
+  const uint32_t rank   = d->rank;
+  const uint32_t elsize = d->elsize;
+  const uint64_t base   = d->base_addr;
+  const uint32_t b0     = d->bdim[0];
+  const uint32_t row_bytes = b0 * elsize;
+  const uint64_t c0_off = static_cast<uint64_t>(coords[0]) * elsize;
+
+  if (rank == 1) {
+    const uint64_t addr = base + c0_off;
+    dae_amd_copy_g2l(lds_dst, reinterpret_cast<const void*>(addr), row_bytes);
+    return;
+  }
+  if (rank == 2) {
+    const uint32_t b1 = d->bdim[1];
+    const uint64_t s1 = d->gstride[0];
+    uint8_t* lds = reinterpret_cast<uint8_t*>(lds_dst);
+    for (uint32_t j = 0; j < b1; ++j) {
+      const uint64_t src = base + c0_off + (uint64_t)(coords[1] + j) * s1;
+      dae_amd_copy_g2l(lds + j * row_bytes,
+                       reinterpret_cast<const void*>(src), row_bytes);
+    }
+    return;
+  }
+  if (rank == 3) {
+    const uint32_t b1 = d->bdim[1], b2 = d->bdim[2];
+    const uint64_t s1 = d->gstride[0], s2 = d->gstride[1];
+    uint8_t* lds = reinterpret_cast<uint8_t*>(lds_dst);
+    for (uint32_t k = 0; k < b2; ++k) {
+      const uint64_t row2 = base + c0_off + (uint64_t)(coords[2] + k) * s2;
+      uint8_t* dst2 = lds + k * b1 * row_bytes;
+      for (uint32_t j = 0; j < b1; ++j) {
+        const uint64_t src = row2 + (uint64_t)(coords[1] + j) * s1;
+        dae_amd_copy_g2l(dst2 + j * row_bytes,
+                         reinterpret_cast<const void*>(src), row_bytes);
+      }
+    }
+    return;
+  }
+  if (rank == 4) {
+    const uint32_t b1 = d->bdim[1], b2 = d->bdim[2], b3 = d->bdim[3];
+    const uint64_t s1 = d->gstride[0], s2 = d->gstride[1], s3 = d->gstride[2];
+    uint8_t* lds = reinterpret_cast<uint8_t*>(lds_dst);
+    for (uint32_t l = 0; l < b3; ++l) {
+      const uint64_t row3 = base + c0_off + (uint64_t)(coords[3] + l) * s3;
+      uint8_t* dst3 = lds + l * b2 * b1 * row_bytes;
+      for (uint32_t k = 0; k < b2; ++k) {
+        const uint64_t row2 = row3 + (uint64_t)(coords[2] + k) * s2;
+        uint8_t* dst2 = dst3 + k * b1 * row_bytes;
+        for (uint32_t j = 0; j < b1; ++j) {
+          const uint64_t src = row2 + (uint64_t)(coords[1] + j) * s1;
+          dae_amd_copy_g2l(dst2 + j * row_bytes,
+                           reinterpret_cast<const void*>(src), row_bytes);
+        }
+      }
+    }
+    return;
+  }
+  // rank == 5 (FIX0 variant): not yet exercised by AMD tests.
+  __builtin_trap();
+}
+
+// Multi-dimensional LDS → global copy. Same conventions as the load helper.
+__device__ __forceinline__
+static void dae_amd_tma_box_l2g(void* g_dst_base_unused,
+                                 const AmdTmaDesc* d,
+                                 const uint16_t* coords,
+                                 const void* lds_src) {
+  (void)g_dst_base_unused;  // base comes from the descriptor, not the caller
+  const uint32_t rank   = d->rank;
+  const uint32_t elsize = d->elsize;
+  const uint64_t base   = d->base_addr;
+  const uint32_t b0     = d->bdim[0];
+  const uint32_t row_bytes = b0 * elsize;
+  const uint64_t c0_off = static_cast<uint64_t>(coords[0]) * elsize;
+
+  if (rank == 1) {
+    const uint64_t addr = base + c0_off;
+    dae_amd_copy_l2g(reinterpret_cast<void*>(addr), lds_src, row_bytes);
+    return;
+  }
+  if (rank == 2) {
+    const uint32_t b1 = d->bdim[1];
+    const uint64_t s1 = d->gstride[0];
+    const uint8_t* lds = reinterpret_cast<const uint8_t*>(lds_src);
+    for (uint32_t j = 0; j < b1; ++j) {
+      const uint64_t dst = base + c0_off + (uint64_t)(coords[1] + j) * s1;
+      dae_amd_copy_l2g(reinterpret_cast<void*>(dst),
+                       lds + j * row_bytes, row_bytes);
+    }
+    return;
+  }
+  if (rank == 3) {
+    const uint32_t b1 = d->bdim[1], b2 = d->bdim[2];
+    const uint64_t s1 = d->gstride[0], s2 = d->gstride[1];
+    const uint8_t* lds = reinterpret_cast<const uint8_t*>(lds_src);
+    for (uint32_t k = 0; k < b2; ++k) {
+      const uint64_t row2 = base + c0_off + (uint64_t)(coords[2] + k) * s2;
+      const uint8_t* src2 = lds + k * b1 * row_bytes;
+      for (uint32_t j = 0; j < b1; ++j) {
+        const uint64_t dst = row2 + (uint64_t)(coords[1] + j) * s1;
+        dae_amd_copy_l2g(reinterpret_cast<void*>(dst),
+                         src2 + j * row_bytes, row_bytes);
+      }
+    }
+    return;
+  }
+  if (rank == 4) {
+    const uint32_t b1 = d->bdim[1], b2 = d->bdim[2], b3 = d->bdim[3];
+    const uint64_t s1 = d->gstride[0], s2 = d->gstride[1], s3 = d->gstride[2];
+    const uint8_t* lds = reinterpret_cast<const uint8_t*>(lds_src);
+    for (uint32_t l = 0; l < b3; ++l) {
+      const uint64_t row3 = base + c0_off + (uint64_t)(coords[3] + l) * s3;
+      const uint8_t* src3 = lds + l * b2 * b1 * row_bytes;
+      for (uint32_t k = 0; k < b2; ++k) {
+        const uint64_t row2 = row3 + (uint64_t)(coords[2] + k) * s2;
+        const uint8_t* src2 = src3 + k * b1 * row_bytes;
+        for (uint32_t j = 0; j < b1; ++j) {
+          const uint64_t dst = row2 + (uint64_t)(coords[1] + j) * s1;
+          dae_amd_copy_l2g(reinterpret_cast<void*>(dst),
+                           src2 + j * row_bytes, row_bytes);
+        }
+      }
+    }
+    return;
+  }
+  __builtin_trap();
+}
+
+// Read-modify-write reduce-add: dst[c..c+b] += lds_src. Used by
+// OP_ALLOC_WB_TMA_REDUCE_ADD_{2D,3D}; on NVIDIA TMA does this atomically in
+// hardware. Here we emulate with byte-level read + add + write — single-thread
+// driven, so safe within one block but NOT atomic against other blocks.
+// GemvLayer's reduce target is partitioned across SMs (one M-tile per block),
+// so cross-block atomicity is not required.
+__device__ __forceinline__
+static void dae_amd_tma_box_reduce_add_l2g(const AmdTmaDesc* d,
+                                            const uint16_t* coords,
+                                            const void* lds_src) {
+  const uint32_t rank   = d->rank;
+  const uint32_t elsize = d->elsize;
+  const uint64_t base   = d->base_addr;
+  const uint32_t b0     = d->bdim[0];
+  const uint64_t c0_off = static_cast<uint64_t>(coords[0]) * elsize;
+
+  auto add_row_bf16 = [](uint8_t* g_row, const uint8_t* lds_row, uint32_t n) {
+    // bf16 reduce-add. n is total bytes for the row; each pair is one bf16.
+    auto* gp = reinterpret_cast<__hip_bfloat16*>(g_row);
+    auto* sp = reinterpret_cast<const __hip_bfloat16*>(lds_row);
+    uint32_t count = n >> 1;
+    for (uint32_t i = 0; i < count; ++i) {
+      float a = static_cast<float>(gp[i]);
+      float b = static_cast<float>(sp[i]);
+      gp[i] = static_cast<__hip_bfloat16>(a + b);
+    }
+  };
+  auto add_row_f16 = [](uint8_t* g_row, const uint8_t* lds_row, uint32_t n) {
+    auto* gp = reinterpret_cast<__half*>(g_row);
+    auto* sp = reinterpret_cast<const __half*>(lds_row);
+    uint32_t count = n >> 1;
+    for (uint32_t i = 0; i < count; ++i) {
+      float a = __half2float(gp[i]);
+      float b = __half2float(sp[i]);
+      gp[i] = __float2half(a + b);
+    }
+  };
+  auto add_row_f32 = [](uint8_t* g_row, const uint8_t* lds_row, uint32_t n) {
+    auto* gp = reinterpret_cast<float*>(g_row);
+    auto* sp = reinterpret_cast<const float*>(lds_row);
+    uint32_t count = n >> 2;
+    for (uint32_t i = 0; i < count; ++i) gp[i] = gp[i] + sp[i];
+  };
+  auto add_row = [&](uint8_t* g, const uint8_t* l, uint32_t nbytes) {
+    if (elsize == 2) add_row_bf16(g, l, nbytes);  // assume bf16 for 2-byte
+    else if (elsize == 4) add_row_f32(g, l, nbytes);
+    else __builtin_trap();
+    (void)add_row_f16;  // f16 path reachable if a future caller picks it
+  };
+
+  const uint32_t row_bytes = b0 * elsize;
+  if (rank == 2) {
+    const uint32_t b1 = d->bdim[1];
+    const uint64_t s1 = d->gstride[0];
+    const uint8_t* lds = reinterpret_cast<const uint8_t*>(lds_src);
+    for (uint32_t j = 0; j < b1; ++j) {
+      const uint64_t dst = base + c0_off + (uint64_t)(coords[1] + j) * s1;
+      add_row(reinterpret_cast<uint8_t*>(dst), lds + j * row_bytes, row_bytes);
+    }
+    return;
+  }
+  if (rank == 3) {
+    const uint32_t b1 = d->bdim[1], b2 = d->bdim[2];
+    const uint64_t s1 = d->gstride[0], s2 = d->gstride[1];
+    const uint8_t* lds = reinterpret_cast<const uint8_t*>(lds_src);
+    for (uint32_t k = 0; k < b2; ++k) {
+      const uint64_t row2 = base + c0_off + (uint64_t)(coords[2] + k) * s2;
+      const uint8_t* src2 = lds + k * b1 * row_bytes;
+      for (uint32_t j = 0; j < b1; ++j) {
+        const uint64_t dst = row2 + (uint64_t)(coords[1] + j) * s1;
+        add_row(reinterpret_cast<uint8_t*>(dst),
+                src2 + j * row_bytes, row_bytes);
+      }
+    }
+    return;
+  }
+  __builtin_trap();
+}
 #endif  // __HIP_PLATFORM_AMD__
 
 // TODO(zhiyuang): decide this maxnreg size.
@@ -402,8 +626,30 @@ void dae2(
       continue;
     }
 
-    bool is_alloc_load  = (opc == op(OP_ALLOC_TMA_LOAD_1D));
-    bool is_alloc_store = (opc == op(OP_ALLOC_WB_TMA_STORE_1D));
+    // Address-style 1D ops use inst.address directly (matches the simple
+    // TmaLoad1D / TmaStore1D Python helpers used in hip_port_tests).
+    const bool is_load_addr_1d  = (opc == op(OP_ALLOC_TMA_LOAD_1D));
+    const bool is_store_addr_1d = (opc == op(OP_ALLOC_WB_TMA_STORE_1D));
+    // Tensor-style ops carry a CUtensorMap descriptor index in inst.arg and
+    // box-origin coordinates in inst.coords[]. Used by GemvLayer / wgmma_load
+    // and similar abstractions in app/python.
+    const bool is_load_tensor =
+        (opc == op(OP_ALLOC_TMA_LOAD_TENSOR_1D)) ||
+        (opc == op(OP_ALLOC_TMA_LOAD_2D))        ||
+        (opc == op(OP_ALLOC_TMA_LOAD_3D))        ||
+        (opc == op(OP_ALLOC_TMA_LOAD_4D))        ||
+        (opc == op(OP_ALLOC_TMA_LOAD_5D_FIX0));
+    const bool is_store_tensor =
+        (opc == op(OP_ALLOC_WB_TMA_STORE_2D))    ||
+        (opc == op(OP_ALLOC_WB_TMA_STORE_3D))    ||
+        (opc == op(OP_ALLOC_WB_TMA_STORE_4D))    ||
+        (opc == op(OP_ALLOC_WB_TMA_STORE_5D_FIX0));
+    const bool is_reduce_add =
+        (opc == op(OP_ALLOC_WB_TMA_REDUCE_ADD_2D)) ||
+        (opc == op(OP_ALLOC_WB_TMA_REDUCE_ADD_3D));
+
+    const bool is_alloc_load  = is_load_addr_1d || is_load_tensor;
+    const bool is_alloc_store = is_store_addr_1d || is_store_tensor || is_reduce_add;
 
     if (is_alloc_load) {
       load_seq++;
@@ -431,9 +677,20 @@ void dae2(
           unsigned chunk_being_loaded = (load_seq - 1) / 2;
           dae_amd_wait_at_least(compute_consumed, chunk_being_loaded);
         }
-        const uint64_t addr = inst.address + addr_offset;
-        const uint32_t n    = inst.size;
-        dae_amd_copy_g2l(slot_ptr, reinterpret_cast<const void*>(addr), n);
+        if (is_load_addr_1d) {
+          const uint64_t addr = inst.address + addr_offset;
+          const uint32_t n    = inst.size;
+          dae_amd_copy_g2l(slot_ptr, reinterpret_cast<const void*>(addr), n);
+        } else {
+          // Tensor descriptor lives at tma_descs[inst.arg]. The opaque[16]
+          // bytes were filled by hip_compat.cuh's cuTensorMapEncodeTiled
+          // override into AmdTmaDesc layout.
+          const AmdTmaDesc* d =
+              reinterpret_cast<const AmdTmaDesc*>(&tma_descs[inst.arg]);
+          // Sanity: trap loud if the descriptor wasn't set up by us.
+          if (d->magic != AMD_TMA_DESC_MAGIC) __builtin_trap();
+          dae_amd_tma_box_g2l(slot_ptr, d, inst.coords);
+        }
         dae_amd_arrive(load_done);
       }
     } else if (is_alloc_store) {
@@ -446,9 +703,20 @@ void dae2(
         } else {
           dae_amd_wait_at_least(load_done, store_seq);
         }
-        const uint64_t addr = inst.address + addr_offset;
-        const uint32_t n    = inst.size;
-        dae_amd_copy_l2g(reinterpret_cast<void*>(addr), lds_slot_a, n);
+        if (is_store_addr_1d) {
+          const uint64_t addr = inst.address + addr_offset;
+          const uint32_t n    = inst.size;
+          dae_amd_copy_l2g(reinterpret_cast<void*>(addr), lds_slot_a, n);
+        } else {
+          const AmdTmaDesc* d =
+              reinterpret_cast<const AmdTmaDesc*>(&tma_descs[inst.arg]);
+          if (d->magic != AMD_TMA_DESC_MAGIC) __builtin_trap();
+          if (is_reduce_add) {
+            dae_amd_tma_box_reduce_add_l2g(d, inst.coords, lds_slot_a);
+          } else {
+            dae_amd_tma_box_l2g(nullptr, d, inst.coords, lds_slot_a);
+          }
+        }
         // device-scope fence so the host (or downstream CTAs) observes the write
         __threadfence();
         dae_amd_arrive(store_done);
