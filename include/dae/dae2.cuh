@@ -98,18 +98,25 @@ static void dae_amd_copy_l2g(void* g_dst, const void* lds_src, uint32_t n) {
 }
 
 // Multi-dimensional global → LDS copy driven by an AmdTmaDesc and the
-// per-instruction starting coordinates. Mirrors what NVIDIA TMA does for
-// non-swizzled tiled loads but is a software loop using dae_amd_copy_g2l for
-// the contiguous innermost row.
+// per-instruction starting coordinates.
 //
-// Layout convention (matches NVIDIA TMA):
-//   - dim 0 is the innermost / contiguous dimension; box[0] elements per row
-//     are loaded contiguously into LDS.
-//   - dim 1+ are stride-jumped in global memory; rows are packed contiguously
-//     in LDS in the same dimension order (no swizzling).
+// LDS layout choice (AMD-specific): we produce a layout that matches the
+// matrix-natural row-major view of the loaded tile, NOT the strict NVIDIA
+// box-major layout. Concretely, when the descriptor describes a row-major
+// (M, K) tile split across multiple K-blocks (rank-3 K-major: dim 0 =
+// intra-blockK, dim 1 = M, dim 2 = K-blocks-outer), and the K-blocks are
+// stride-contiguous in memory (gstride[1] == bdim[0] * elsize), we *fold*
+// dims 0 and 2 into a single contiguous "matrix row" of width
+// (bdim[0] * bdim[2]) elements. The result is LDS[m*K_tile + k] = mat[m, k],
+// which is what the AMD MFMA loop in dae2.cuh consumes via
+//   sA[(m_base + row_in16) * K_chunk + (k_base + ...)]
 //
-// `coords[i]` is the start index along dim i of the box origin in the global
-// tensor. estride is assumed to be 1 (true for every caller in this repo).
+// This deviation from NVIDIA box-major is fine because the AMD compute
+// paths have always been hand-written for AMD's data layout — there is no
+// hardware that requires the strict box-major LDS form here.
+//
+// Patterns NOT folded fall back to the generic outer-to-inner box walk,
+// which preserves NVIDIA TMA semantics (innermost-first LDS layout).
 __device__ __forceinline__
 static void dae_amd_tma_box_g2l(void* lds_dst,
                                  const AmdTmaDesc* d,
@@ -127,6 +134,8 @@ static void dae_amd_tma_box_g2l(void* lds_dst,
     return;
   }
   if (rank == 2) {
+    // Already row-major: each step in dim 1 is one matrix row of bdim[0]
+    // contiguous elements.
     const uint32_t b1 = d->bdim[1];
     const uint64_t s1 = d->gstride[0];
     uint8_t* lds = reinterpret_cast<uint8_t*>(lds_dst);
@@ -141,6 +150,20 @@ static void dae_amd_tma_box_g2l(void* lds_dst,
     const uint32_t b1 = d->bdim[1], b2 = d->bdim[2];
     const uint64_t s1 = d->gstride[0], s2 = d->gstride[1];
     uint8_t* lds = reinterpret_cast<uint8_t*>(lds_dst);
+    // K-major fold: dims 0 and 2 are contiguous in memory => fold into a
+    // single contiguous K-row of (b0 * b2) elements per matrix row j.
+    if (s2 == static_cast<uint64_t>(b0) * elsize) {
+      const uint64_t full_row_bytes = static_cast<uint64_t>(b0) * b2 * elsize;
+      const uint64_t origin = base + c0_off
+                            + static_cast<uint64_t>(coords[2]) * s2;
+      for (uint32_t j = 0; j < b1; ++j) {
+        const uint64_t src = origin + (uint64_t)(coords[1] + j) * s1;
+        dae_amd_copy_g2l(lds + j * full_row_bytes,
+                         reinterpret_cast<const void*>(src), full_row_bytes);
+      }
+      return;
+    }
+    // Generic 3D box walk fallback (box-major LDS layout).
     for (uint32_t k = 0; k < b2; ++k) {
       const uint64_t row2 = base + c0_off + (uint64_t)(coords[2] + k) * s2;
       uint8_t* dst2 = lds + k * b1 * row_bytes;
@@ -156,6 +179,23 @@ static void dae_amd_tma_box_g2l(void* lds_dst,
     const uint32_t b1 = d->bdim[1], b2 = d->bdim[2], b3 = d->bdim[3];
     const uint64_t s1 = d->gstride[0], s2 = d->gstride[1], s3 = d->gstride[2];
     uint8_t* lds = reinterpret_cast<uint8_t*>(lds_dst);
+    // K-major-batched fold: dims 0 and 2 contiguous, dim 3 is batch outer.
+    if (s2 == static_cast<uint64_t>(b0) * elsize) {
+      const uint64_t full_row_bytes = static_cast<uint64_t>(b0) * b2 * elsize;
+      for (uint32_t l = 0; l < b3; ++l) {
+        const uint64_t batch = base + c0_off
+                             + (uint64_t)(coords[3] + l) * s3
+                             + (uint64_t)coords[2] * s2;
+        uint8_t* dst3 = lds + l * b1 * full_row_bytes;
+        for (uint32_t j = 0; j < b1; ++j) {
+          const uint64_t src = batch + (uint64_t)(coords[1] + j) * s1;
+          dae_amd_copy_g2l(dst3 + j * full_row_bytes,
+                           reinterpret_cast<const void*>(src), full_row_bytes);
+        }
+      }
+      return;
+    }
+    // Generic 4D box walk fallback.
     for (uint32_t l = 0; l < b3; ++l) {
       const uint64_t row3 = base + c0_off + (uint64_t)(coords[3] + l) * s3;
       uint8_t* dst3 = lds + l * b2 * b1 * row_bytes;
