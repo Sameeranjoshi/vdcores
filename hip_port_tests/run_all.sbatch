@@ -86,6 +86,15 @@ run_test "compute: chunked GEMV (K up to 4096)" 120 \
 run_test "compute: GEMV_WGMMA (Gemv_M64N8 family opcode)" 120 \
   python -u hip_port_tests/python/mfma_gemv_wgmma_test.py
 
+# 2D TMA smoke: validates AmdTmaDesc + multi-D box walk against a known LDS layout.
+run_test "tma: 2D smoke (descriptor-based load)" 30 \
+  python -u hip_port_tests/python/tma2d_smoke.py
+
+# 2D TMA bench through GemvLayer-style wgmma_load (Major.MN), Dummy compute.
+# Validates the descriptor + box walk path under realistic multi-block traffic.
+run_test "tma: tmatensor 2D wgmma_load (132 SMs)" 60 \
+  python -u app/python/tmatensor.py -b 5
+
 echo ""
 echo "=== job ${SLURM_JOB_ID} done ==="
 date
